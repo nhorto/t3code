@@ -1,5 +1,9 @@
 import {
-  type EnvironmentId,
+  Backlog,
+  BacklogIssue,
+  BacklogLinkedHub,
+  EnvironmentId,
+  IsoDateTime,
   OrchestrationProjectShell,
   type OrchestrationShellSnapshot,
   type OrchestrationThreadDetailSnapshot,
@@ -36,6 +40,8 @@ export class ConnectionPersistenceError extends Schema.TaggedError<ConnectionPer
       "remove-vcs-refs",
       "clear-vcs-refs",
       "clear-environment",
+      "load-backlog-board",
+      "save-backlog-board",
     ]),
     message: Schema.String,
   },
@@ -153,3 +159,37 @@ export class EnvironmentOwnedDataCleanup extends Context.Reference<{
     clear: () => Effect.void,
   }),
 }) {}
+
+/** One environment's backlog board as last seen, for showing it read-only while offline. */
+export const StoredBacklogBoard = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  environmentId: EnvironmentId,
+  /** When the board was last known to match its environment. */
+  asOf: IsoDateTime,
+  backlogs: Schema.Array(Backlog),
+  issues: Schema.Array(BacklogIssue),
+  /** The hub the environment was linked to; absent in copies saved before it was kept. */
+  linkedHub: Schema.optional(Schema.NullOr(BacklogLinkedHub)),
+});
+export type StoredBacklogBoard = typeof StoredBacklogBoard.Type;
+
+/**
+ * Where a client keeps each environment's last backlog board. Platforms
+ * without it keep nothing: the board then shows only while connected.
+ */
+export interface BacklogBoardCacheStoreShape {
+  readonly load: (
+    environmentId: EnvironmentId,
+  ) => Effect.Effect<Option.Option<StoredBacklogBoard>, ConnectionPersistenceError>;
+  readonly save: (board: StoredBacklogBoard) => Effect.Effect<void, ConnectionPersistenceError>;
+}
+
+export class BacklogBoardCacheStore extends Context.Reference<BacklogBoardCacheStoreShape>(
+  "@t3tools/client-runtime/platform/persistence/BacklogBoardCacheStore",
+  {
+    defaultValue: () => ({
+      load: () => Effect.succeed(Option.none()),
+      save: () => Effect.void,
+    }),
+  },
+) {}

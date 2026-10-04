@@ -171,6 +171,14 @@
       "types": "./src/state/providerInstanceDisplay.ts",
       "default": "./src/state/providerInstanceDisplay.ts"
     },
+    "./state/backlog": {
+      "types": "./src/state/backlog.ts",
+      "default": "./src/state/backlog.ts"
+    },
+    "./state/agent-messages": {
+      "types": "./src/state/agentMessages.ts",
+      "default": "./src/state/agentMessages.ts"
+    },
     "./state/pull-requests": {
       "types": "./src/state/pullRequests.ts",
       "default": "./src/state/pullRequests.ts"
