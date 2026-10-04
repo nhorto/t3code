@@ -336,6 +336,7 @@ import {
   BacklogHubLinkStatus,
   BacklogLinkHubInput,
   BacklogLinkPullRequestInput,
+  BacklogMoveInboxToHubResult,
   BacklogListIssuesInput,
   BacklogRenewClaimsInput,
   BacklogResolveIssueInput,
@@ -538,6 +539,7 @@ export const WS_METHODS = {
   backlogExportBacklog: "backlog.exportBacklog",
   backlogImportBacklog: "backlog.importBacklog",
   backlogRestoreBacklog: "backlog.restoreBacklog",
+  backlogMoveInboxToHub: "backlog.moveInboxToHub",
 
   // Agent messages
   agentMessagesSubscribe: "agentMessages.subscribe",
@@ -1874,6 +1876,13 @@ const WsBacklogRestoreBacklogRpc = Rpc.make(WS_METHODS.backlogRestoreBacklog, {
   error: BacklogRpcError,
 });
 
+/** On a machine linked to a hub, moves its legacy Inbox's open issues to the hub's Inbox. */
+const WsBacklogMoveInboxToHubRpc = Rpc.make(WS_METHODS.backlogMoveInboxToHub, {
+  payload: Schema.Struct({}),
+  success: BacklogMoveInboxToHubResult,
+  error: BacklogRpcError,
+});
+
 const AgentMessageRpcError = Schema.Union([AgentMessageError, EnvironmentAuthorizationError]);
 
 // The hub's post office for agent messages between linked machines.
@@ -2055,6 +2064,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsBacklogExportBacklogRpc,
   WsBacklogImportBacklogRpc,
   WsBacklogRestoreBacklogRpc,
+  WsBacklogMoveInboxToHubRpc,
   WsAgentMessagesSubscribeRpc,
   WsAgentMessagesReleaseRpc,
   WsAgentMessagesDismissRpc,

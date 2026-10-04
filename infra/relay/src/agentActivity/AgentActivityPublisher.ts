@@ -6,6 +6,7 @@ export {
 import type {
   RelayAgentActivityState,
   RelayDeliveryResult,
+  RelayHeldAgentMessageNotification,
   RelayPublishResponse,
 } from "@t3tools/contracts/relay";
 import * as Context from "effect/Context";
@@ -39,6 +40,12 @@ export class AgentActivityPublisher extends Context.Service<
       readonly environmentPublicKey: string;
       readonly threadId: string;
       readonly state: RelayAgentActivityState | null;
+    }) => Effect.Effect<RelayPublishResponse, AgentActivityPublishError>;
+    /** Alerts every device of users who take notifications from the environment. */
+    readonly publishHeldAgentMessage: (input: {
+      readonly environmentId: string;
+      readonly environmentPublicKey: string;
+      readonly notification: RelayHeldAgentMessageNotification;
     }) => Effect.Effect<RelayPublishResponse, AgentActivityPublishError>;
     readonly replayForLiveActivityRegistration: (input: {
       readonly userId: string;
@@ -108,7 +115,49 @@ export const make = Effect.gen(function* () {
     return deliveriesByTarget.flat();
   });
 
+  const sendHeldAgentMessage = (
+    target: LiveActivities.TargetRow,
+    notification: RelayHeldAgentMessageNotification,
+  ): Effect.Effect<RelayDeliveryResult | null, AgentActivityPublishError> =>
+    target.platform === "android"
+      ? fcmDeliveries.enqueueHeldAgentMessage({ target, notification })
+      : apnsDeliveries.sendHeldAgentMessageForTarget({ target, notification });
+
   return AgentActivityPublisher.of({
+    publishHeldAgentMessage: Effect.fn("relay.agent_activity_publisher.publish_held_agent_message")(
+      function* (input) {
+        yield* Effect.annotateCurrentSpan({
+          "relay.environment_id": input.environmentId,
+          "relay.thread_id": input.notification.threadId,
+        });
+        const deliveryUsers = yield* links.listDeliveryUsersForEnvironment({
+          environmentId: input.environmentId,
+          environmentPublicKey: input.environmentPublicKey,
+        });
+        const deliveriesByUser = yield* Effect.forEach(
+          deliveryUsers.filter((user) => user.notificationsEnabled),
+          (deliveryUser) =>
+            liveActivities
+              .listTargets({ userId: deliveryUser.userId })
+              .pipe(
+                Effect.flatMap((targets) =>
+                  Effect.forEach(
+                    targets,
+                    (target) => sendHeldAgentMessage(target, input.notification),
+                    { concurrency: 4 },
+                  ),
+                ),
+              ),
+          { concurrency: 4 },
+        );
+        return {
+          ok: true,
+          deliveries: deliveriesByUser
+            .flat()
+            .filter((delivery): delivery is RelayDeliveryResult => delivery !== null),
+        };
+      },
+    ),
     replayForLiveActivityRegistration: Effect.fn(
       "relay.agent_activity_publisher.replay_for_live_activity_registration",
     )(function* (input) {

@@ -13,11 +13,13 @@ import {
   EMPTY_BACKLOG_BOARD,
   backlogBoardForCache,
   backlogBoardFromCache,
+  backlogFleet,
   claimTakeoverMessage,
   foldBacklogStreamEvent,
   groupBacklogIssuesByStatus,
   isBacklogUnsupportedCause,
   isIssueBlockedOnBoard,
+  legacyBacklogInbox,
 } from "./backlog.ts";
 
 const backlog: Backlog = {
@@ -234,5 +236,61 @@ describe("the offline copy of a board", () => {
     expect(
       stored.issues.some((entry) => entry.id === `issue-${BACKLOG_CACHE_MAX_ISSUES + 4}`),
     ).toBe(true);
+  });
+});
+
+describe("one Inbox per fleet", () => {
+  const geekom = { environmentId: EnvironmentId.make("environment-geekom"), label: "Geekom" };
+  const mac = EnvironmentId.make("environment-mac");
+  const laptop = EnvironmentId.make("environment-laptop");
+  const inbox: Backlog = {
+    ...backlog,
+    id: BacklogId.make("backlog-inbox"),
+    kind: "inbox",
+    key: "INBOX",
+    title: "Inbox",
+  };
+
+  it("keeps the hub an environment is linked to from snapshots and the offline copy", () => {
+    const linked = foldBacklogStreamEvent(EMPTY_BACKLOG_BOARD, {
+      type: "snapshot",
+      backlogs: [],
+      issues: [],
+      linkedHub: geekom,
+    });
+    const updated = foldBacklogStreamEvent(linked, { type: "backlogUpserted", backlog });
+    expect(updated.linkedHub).toEqual(geekom);
+    const restored = backlogBoardFromCache(backlogBoardForCache(mac, updated, 1_767_312_000_000));
+    expect(restored.linkedHub).toEqual(geekom);
+    // A server that predates the field reads as unlinked.
+    expect(
+      foldBacklogStreamEvent(linked, { type: "snapshot", backlogs: [], issues: [] }).linkedHub,
+    ).toBeNull();
+  });
+
+  it("finds the hub and the environments linked to it, preferring a hub this client sees", () => {
+    const other = {
+      environmentId: EnvironmentId.make("environment-elsewhere"),
+      label: "Elsewhere",
+    };
+    const fleet = backlogFleet([
+      { environmentId: laptop, board: { linkedHub: other } },
+      { environmentId: mac, board: { linkedHub: geekom } },
+      { environmentId: geekom.environmentId, board: { linkedHub: null } },
+    ]);
+    expect(fleet?.hub).toEqual(geekom);
+    expect([...(fleet?.spokeEnvironmentIds ?? [])]).toEqual([mac]);
+    expect(backlogFleet([{ environmentId: mac, board: { linkedHub: null } }])).toBeNull();
+  });
+
+  it("calls a linked environment's own Inbox legacy and counts what is still open", () => {
+    const issues = [
+      issue("open", { backlogId: inbox.id, status: "inbox" }),
+      issue("closed", { backlogId: inbox.id, status: "wontfix" }),
+      issue("project"),
+    ];
+    const legacy = legacyBacklogInbox({ backlogs: [inbox, backlog], issues, linkedHub: geekom });
+    expect(legacy).toEqual({ backlog: inbox, hub: geekom, openCount: 1 });
+    expect(legacyBacklogInbox({ backlogs: [inbox], issues, linkedHub: null })).toBeNull();
   });
 });

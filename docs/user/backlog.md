@@ -60,7 +60,8 @@ Choose **Messages** on the Backlog to see every agent message. To stop two agent
 thread accepts at most 10 agent messages an hour. Further messages are **held**: the Backlog
 sidebar button shows how many, and you can **Release** or **Dismiss** each one from the machine
 the receiving thread runs on. Sending your own message to that thread also lets its held messages
-through. A thread holds at most 50 messages; beyond that, senders are told to wait.
+through. A thread holds at most 50 messages; beyond that, senders are told to wait. With
+[mobile notifications](mobile-notifications.md) on, your phone is alerted when messages are held.
 
 ## Where the data lives
 
@@ -80,7 +81,9 @@ and link the others to it:
 
 Agents on a linked machine then find, claim and update the hub's issues as if they were local, and
 new project boards and Inbox ideas from their chats go to the hub. A board that already exists on
-the linked machine stays there. If the hub is unreachable, agents can still read what it last
+the linked machine stays there. With a hub, there is one Inbox for every machine: the hub's. A
+machine that collected ideas before it was linked lists its old Inbox under it until you open it
+and move them to the hub's Inbox. If the hub is unreachable, agents can still read what it last
 reported, marked as possibly out of date, but cannot change anything on it until it is back. The link reaches only backlogs and lasts a year; unlink it from
 **Settings → Backlog**. Unlinking does not end the session on the hub; revoke it there under
 **Settings → Connections**.

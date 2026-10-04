@@ -4,7 +4,10 @@ import { useLinkTo } from "@react-navigation/native";
 
 import { setAndroidThreadOnScreen } from "./androidNotifications";
 import { foregroundNotificationBehavior } from "./foregroundNotificationBehavior";
-import { routeAgentNotificationResponseOnce, threadDeepLinkOnScreen } from "./notificationPayload";
+import {
+  notificationDeepLinkOnScreen,
+  routeAgentNotificationResponseOnce,
+} from "./notificationPayload";
 import { consumeLastAgentNotificationResponse } from "./notificationResponseConsumer";
 
 export function useAgentNotificationNavigation(pathname: string): void {
@@ -14,11 +17,11 @@ export function useAgentNotificationNavigation(pathname: string): void {
   // current route without re-registering on every navigation.
   const deepLinkOnScreen = useRef<string | null>(null);
   useLayoutEffect(() => {
-    const thread = threadDeepLinkOnScreen(pathname);
-    deepLinkOnScreen.current = thread;
+    const onScreen = notificationDeepLinkOnScreen(pathname);
+    deepLinkOnScreen.current = onScreen;
     // Android alerts are built natively from FCM data, so update the native
     // route at commit time alongside the iOS handler's route reference.
-    setAndroidThreadOnScreen(thread);
+    setAndroidThreadOnScreen(onScreen);
   }, [pathname]);
 
   useEffect(() => {

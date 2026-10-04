@@ -281,6 +281,43 @@ export const RelayAgentActivityPublishRequest = Schema.Struct({
 }).annotate({ description: "Publishes a signed agent-awareness update from an environment." });
 export type RelayAgentActivityPublishRequest = typeof RelayAgentActivityPublishRequest.Type;
 
+/** Where a held agent message notification opens: the mobile Messages screen. */
+export const RELAY_HELD_AGENT_MESSAGES_DEEP_LINK = "/backlog/messages";
+
+/**
+ * A one-shot alert that agent messages were held for the user on a receiving
+ * thread. The environment coalesces bursts, so `count` can exceed one.
+ */
+export const RelayHeldAgentMessageNotification = Schema.Struct({
+  environmentId: EnvironmentId,
+  /** The receiving thread the messages are held for. */
+  threadId: ThreadId,
+  title: TrimmedNonEmptyString,
+  body: TrimmedNonEmptyString,
+  count: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
+  /** The newest message in this alert; identifies the alert. */
+  messageId: TrimmedNonEmptyString,
+  deepLink: Schema.Literal(RELAY_HELD_AGENT_MESSAGES_DEEP_LINK),
+});
+export type RelayHeldAgentMessageNotification = typeof RelayHeldAgentMessageNotification.Type;
+
+export const RelayHeldAgentMessagePublishProofPayload = Schema.Struct({
+  ...RelaySignedJwtRegisteredClaims,
+  environmentId: EnvironmentId,
+  threadId: ThreadId,
+  notification: RelayHeldAgentMessageNotification,
+});
+export type RelayHeldAgentMessagePublishProofPayload =
+  typeof RelayHeldAgentMessagePublishProofPayload.Type;
+
+export const RelayHeldAgentMessagePublishRequest = Schema.Struct({
+  notification: RelayHeldAgentMessageNotification,
+  proof: TrimmedNonEmptyString.annotate({
+    description: "Environment-signed JWT covering this notification.",
+  }),
+}).annotate({ description: "Alerts the user's devices that agent messages are held." });
+export type RelayHeldAgentMessagePublishRequest = typeof RelayHeldAgentMessagePublishRequest.Type;
+
 export const RelayEnvironmentLinkScope = Schema.Literals([
   "agent_activity_notifications",
   "managed_tunnels",
@@ -1171,6 +1208,19 @@ const RelayServerGroup = HttpApiGroup.make("server")
         error: RelayAgentActivityPublishErrors,
       },
     ).annotate(OpenApi.Summary, "Publish agent activity"),
+    HttpApiEndpoint.post(
+      "publishHeldAgentMessage",
+      "/v1/environments/:environmentId/threads/:threadId/held-agent-messages",
+      {
+        params: Schema.Struct({
+          environmentId: EnvironmentId,
+          threadId: ThreadId,
+        }),
+        payload: RelayHeldAgentMessagePublishRequest,
+        success: RelayPublishResponse,
+        error: RelayAgentActivityPublishErrors,
+      },
+    ).annotate(OpenApi.Summary, "Notify that agent messages are held"),
   )
   .annotate(OpenApi.Description, "Environment-authenticated activity publication.")
   .middleware(RelayEnvironmentAuth);

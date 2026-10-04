@@ -24,6 +24,7 @@ const publisherLayer = AgentActivityPublisher.layer.pipe(
   Layer.provide(
     Layer.succeed(FcmDeliveries.FcmDeliveries, {
       enqueue: () => Effect.succeed(null),
+      enqueueHeldAgentMessage: () => Effect.succeed(null),
       process: () => Effect.void,
     }),
   ),
@@ -189,6 +190,7 @@ function makeAgentActivityPublisher(
 ): AgentActivityPublisher.AgentActivityPublisher["Service"] {
   return {
     publish: () => Effect.succeed({ ok: true, deliveries: [] }),
+    publishHeldAgentMessage: () => Effect.succeed({ ok: true, deliveries: [] }),
     replayForLiveActivityRegistration: () => Effect.succeed(null),
     ...overrides,
   };

@@ -20,10 +20,11 @@ import expo.modules.notifications.service.ExpoFirebaseMessagingService
 
 class AgentMessagingService : ExpoFirebaseMessagingService() {
   override fun onMessageReceived(remoteMessage: RemoteMessage) {
-    if (remoteMessage.data["t3_kind"] == "agent_activity") {
-      AgentNotifications.receive(this, remoteMessage.data)
-    } else {
-      super.onMessageReceived(remoteMessage)
+    when (remoteMessage.data["t3_kind"]) {
+      "agent_activity" -> AgentNotifications.receive(this, remoteMessage.data)
+      // One-shot alerts, such as held agent messages, never touch the activity card.
+      "agent_alert" -> AgentNotifications.receive(this, remoteMessage.data, updateCard = false)
+      else -> super.onMessageReceived(remoteMessage)
     }
   }
 }
@@ -51,6 +52,8 @@ object AgentNotifications {
   private const val MAX_MESSAGE_AGE_MS = 10 * 60 * 1000L
   private const val RUNNING_LIFETIME_MS = 2 * 60 * 60 * 1000L
   private const val MAX_LIFETIME_MS = 24 * 60 * 60 * 1000L
+  /** The only non-thread route an alert may open: the agent Messages screen. */
+  private const val MESSAGES_PATH = "/backlog/messages"
 
   @Synchronized
   fun configure(
@@ -118,7 +121,7 @@ object AgentNotifications {
   }
 
   @Synchronized
-  fun receive(context: Context, data: Map<String, String>) {
+  fun receive(context: Context, data: Map<String, String>, updateCard: Boolean = true) {
     val prefs = context.getSharedPreferences(STORE, Context.MODE_PRIVATE)
     val updatedAt = data["updated_at"]?.toLongOrNull() ?: return
     val registered = prefs.getBoolean("enabled", false) &&
@@ -129,7 +132,7 @@ object AgentNotifications {
       channels(context)
       val scheme = prefs.getString("scheme", "t3code") ?: "t3code"
       showAlert(context, prefs, scheme, data)
-      updateActivity(context, prefs, scheme, data, updatedAt)
+      if (updateCard) updateActivity(context, prefs, scheme, data, updatedAt)
     }
   }
 
@@ -346,7 +349,7 @@ object AgentNotifications {
     path: String?,
     id: Int
   ): PendingIntent? {
-    val threadPath = path?.takeIf { it.startsWith("/threads/") }
+    val threadPath = path?.takeIf { it.startsWith("/threads/") || it == MESSAGES_PATH }
     val route = threadPath?.takeUnless { it.contains('?') || it.contains('#') } ?: "/"
     val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)
       ?: return null

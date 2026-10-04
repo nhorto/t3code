@@ -11,6 +11,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Stream from "effect/Stream";
 
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
@@ -18,7 +19,7 @@ import * as ProjectService from "../project/ProjectService.ts";
 import { localBacklogHome, type BacklogHome } from "./BacklogHome.ts";
 import * as BacklogHubClient from "./BacklogHubClient.ts";
 import * as BacklogHubSnapshot from "./BacklogHubSnapshot.ts";
-import { BacklogRouter, layer as routerLayer } from "./BacklogRouter.ts";
+import { BacklogRouter, inboxLayer, layer as routerLayer } from "./BacklogRouter.ts";
 import { BacklogService, layer as serviceLayer } from "./BacklogService.ts";
 
 const spoke = EnvironmentId.make("environment-mac");
@@ -98,6 +99,8 @@ const unreachable: BacklogHome = (() => {
  * service, which is exactly what the hub's RPC handlers call. `setHubUp`
  * takes the hub off the network and back.
  */
+const geekom = { environmentId: EnvironmentId.make("environment-geekom"), label: "Geekom" };
+
 const fleet = (hubState: "up" | "down" | "not_linked") =>
   Effect.gen(function* () {
     const hub = Context.get(yield* Layer.build(backlogService({})), BacklogService);
@@ -110,8 +113,9 @@ const fleet = (hubState: "up" | "down" | "not_linked") =>
           ((hubUp ? hubHome : unreachable) as unknown as Record<string, Function>)[name]!(...args),
       ]),
     ) as unknown as BacklogHome;
+    const linkedHub = hubState === "not_linked" ? Option.none() : Option.some(geekom);
     const spokeContext = yield* Layer.build(
-      routerLayer.pipe(
+      Layer.mergeAll(routerLayer, inboxLayer).pipe(
         Layer.provideMerge(backlogService(spokeProjects)),
         Layer.provideMerge(BacklogHubSnapshot.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
         Layer.provideMerge(
@@ -121,14 +125,8 @@ const fleet = (hubState: "up" | "down" | "not_linked") =>
         ),
         Layer.provide(
           Layer.mock(BacklogHubClient.BacklogHubClient)({
-            linkedHub: Effect.succeed(
-              hubState === "not_linked"
-                ? Option.none()
-                : Option.some({
-                    environmentId: EnvironmentId.make("environment-geekom"),
-                    label: "Geekom",
-                  }),
-            ),
+            linkedHub: Effect.succeed(linkedHub),
+            linkedHubChanges: Stream.make(linkedHub),
             home: switchable,
           }),
         ),
@@ -221,7 +219,7 @@ it.effect("reports an unreachable hub as unavailable instead of guessing", () =>
 it.effect("lists this machine's issues with the hub's, marking a down hub", () =>
   Effect.gen(function* () {
     const up = yield* fleet("up");
-    yield* up.local.createIssue({ title: "Here" }, hubUser);
+    yield* up.local.createIssue({ projectId: scratch, title: "Here" }, hubUser);
     yield* up.hub.createIssue({ title: "There" }, hubUser);
     const merged = yield* up.router.listIssues({});
     assert.deepEqual(
@@ -234,7 +232,7 @@ it.effect("lists this machine's issues with the hub's, marking a down hub", () =
     assert.deepEqual(merged.hub, { label: "Geekom", state: "connected", message: null });
 
     const down = yield* fleet("down");
-    yield* down.local.createIssue({ title: "Here" }, hubUser);
+    yield* down.local.createIssue({ projectId: scratch, title: "Here" }, hubUser);
     const partial = yield* down.router.listIssues({});
     assert.deepEqual(
       partial.issues.map((issue) => issue.title),
@@ -252,7 +250,7 @@ it.effect("never creates a backlog to answer a read", () =>
     assert.isNull(yield* router.claimNext({ projectId: corkAndNote }, agent));
     assert.deepEqual(
       [(yield* local.listBacklogs()).length, (yield* hub.listBacklogs()).length],
-      [1, 1],
+      [0, 0],
     );
   }).pipe(Effect.scoped),
 );
@@ -354,17 +352,27 @@ it.effect("names where a backlog went when it moved somewhere this machine canno
 it.effect("refuses a key both machines use, and says which machine answered", () =>
   Effect.gen(function* () {
     const { router, local, hub } = yield* fleet("up");
-    const here = yield* local.createIssue({ title: "Here", status: "ready" }, hubUser);
-    const there = yield* hub.createIssue({ title: "There", status: "ready" }, hubUser);
-    assert.deepEqual([here.key, there.key], ["INBOX-1", "INBOX-1"]);
+    const here = yield* local.createIssue(
+      { projectId: scratch, title: "Here", status: "ready" },
+      hubUser,
+    );
+    const there = yield* hub.createIssue(
+      {
+        repository: { key: "github.com/someone/scratch", title: "Scratch" },
+        title: "There",
+        status: "ready",
+      },
+      hubUser,
+    );
+    assert.deepEqual([here.key, there.key], ["SCRATC-1", "SCRATC-1"]);
 
-    const ambiguous = yield* router.getIssue("inbox-1").pipe(Effect.flip);
+    const ambiguous = yield* router.getIssue("scratc-1").pipe(Effect.flip);
     assert.equal(ambiguous.code, "invalid");
     assert.include(ambiguous.message, here.id);
     assert.include(ambiguous.message, there.id);
     assert.include(ambiguous.message, "Geekom");
     assert.equal(
-      (yield* router.listIssues({ backlog: "INBOX" }).pipe(Effect.flip)).code,
+      (yield* router.listIssues({ backlog: "SCRATC" }).pipe(Effect.flip)).code,
       "invalid",
     );
 
@@ -372,5 +380,97 @@ it.effect("refuses a key both machines use, and says which machine answered", ()
     assert.deepEqual([read.host, read.machine], ["hub", "Geekom"]);
     const claimed = yield* router.claim(here.id, agent);
     assert.deepEqual([claimed.host, claimed.machine], ["local", "this machine"]);
+  }).pipe(Effect.scoped),
+);
+
+it.effect("keeps one Inbox for the fleet: a linked machine has none and INBOX is the hub's", () =>
+  Effect.gen(function* () {
+    const { router, local, hub } = yield* fleet("up");
+    assert.lengthOf(yield* local.listBacklogs(), 0);
+    const first = yield* router.createIssue({ title: "Voice capture" }, agent);
+    const second = yield* router.createIssue({ backlog: "inbox", title: "Widgets" }, agent);
+    assert.deepEqual([first.key, second.key], ["INBOX-1", "INBOX-2"]);
+    assert.lengthOf(yield* local.listBacklogs(), 0);
+    assert.equal((yield* hub.getIssue({ issueId: second.id })).issue.title, "Widgets");
+
+    // An Inbox from before the link is legacy: INBOX-n still means the hub's.
+    const legacy = yield* local.createIssue({ title: "Old idea", status: "ready" }, hubUser);
+    assert.equal(legacy.key, "INBOX-1");
+    const resolved = yield* router.getIssue("INBOX-1");
+    assert.deepEqual([resolved.issue.id, resolved.host], [first.id, "hub"]);
+    assert.equal((yield* router.listIssues({ backlog: "INBOX" })).issues.length, 2);
+    // Its issues stay reachable by id, but leave listings and claim-next.
+    assert.equal((yield* router.getIssue(legacy.id)).host, "local");
+    assert.deepEqual(
+      (yield* router.listIssues({})).issues.map((issue) => issue.id),
+      [first.id, second.id],
+    );
+    assert.deepEqual(
+      (yield* router.listBacklogs()).backlogs.map((backlog) => [backlog.key, backlog.host]),
+      [["INBOX", "hub"]],
+    );
+    assert.isNull(yield* router.claimNext({}, agent));
+
+    const snapshot = yield* router.subscribe().pipe(Stream.take(1), Stream.runCollect);
+    const [event] = Array.from(snapshot);
+    assert.deepEqual(event?.type === "snapshot" ? event.linkedHub : undefined, geekom);
+  }).pipe(Effect.scoped),
+);
+
+it.effect("gives an unlinked machine its own Inbox at startup", () =>
+  Effect.gen(function* () {
+    const { router, local } = yield* fleet("not_linked");
+    assert.deepEqual(
+      (yield* local.listBacklogs()).map((backlog) => backlog.key),
+      ["INBOX"],
+    );
+    const snapshot = yield* router.subscribe().pipe(Stream.take(1), Stream.runCollect);
+    const [event] = Array.from(snapshot);
+    assert.isNull(event?.type === "snapshot" ? event.linkedHub : undefined);
+    const moved = yield* router.moveInboxToHub(hubUser).pipe(Effect.flip);
+    assert.equal(moved.code, "invalid");
+  }).pipe(Effect.scoped),
+);
+
+it.effect("moves a legacy Inbox's open issues to the hub's Inbox and closes them here", () =>
+  Effect.gen(function* () {
+    const { router, local, hub } = yield* fleet("up");
+    yield* hub.createIssue({ title: "Already there" }, hubUser);
+    const spec = yield* local.createIssue(
+      { title: "Spec", body: "The plan", type: "feature", priority: "p1" },
+      hubUser,
+    );
+    const child = yield* local.createIssue({ title: "Part", parentId: spec.id }, hubUser);
+    const done = yield* local.createIssue({ title: "Shipped", status: "done" }, hubUser);
+    const held = yield* local.createIssue({ title: "Busy", status: "ready" }, hubUser);
+    yield* local.claim({ issueId: held.id }, agent);
+
+    const result = yield* router.moveInboxToHub(hubUser);
+    assert.deepEqual(result, {
+      hub: "Geekom",
+      moved: [
+        { from: spec.key, to: "INBOX-2" },
+        { from: child.key, to: "INBOX-3" },
+      ],
+      skipped: [held.key],
+    });
+
+    const movedSpec = yield* router.getIssue("INBOX-2");
+    assert.deepEqual(
+      [movedSpec.body, movedSpec.issue.type, movedSpec.issue.priority, movedSpec.issue.status],
+      ["The plan", "feature", "p1", "inbox"],
+    );
+    assert.equal((yield* router.getIssue("INBOX-3")).issue.parentId, movedSpec.issue.id);
+
+    const left = yield* local.getIssue({ issueId: spec.id });
+    assert.equal(left.issue.status, "wontfix");
+    assert.equal(left.activity.at(-1)?.text, "Moved to Geekom Inbox as INBOX-2.");
+    assert.equal((yield* local.getIssue({ issueId: done.id })).issue.status, "done");
+    assert.equal((yield* local.getIssue({ issueId: held.id })).issue.status, "in_progress");
+
+    // Running it again moves nothing twice.
+    const again = yield* router.moveInboxToHub(hubUser);
+    assert.deepEqual([again.moved, again.skipped], [[], [held.key]]);
+    assert.lengthOf(yield* hub.listIssues(), 3);
   }).pipe(Effect.scoped),
 );

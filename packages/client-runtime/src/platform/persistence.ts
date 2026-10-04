@@ -1,6 +1,7 @@
 import {
   Backlog,
   BacklogIssue,
+  BacklogLinkedHub,
   EnvironmentId,
   IsoDateTime,
   type OrchestrationV2ShellSnapshot,
@@ -151,6 +152,8 @@ export const StoredBacklogBoard = Schema.Struct({
   asOf: IsoDateTime,
   backlogs: Schema.Array(Backlog),
   issues: Schema.Array(BacklogIssue),
+  /** The hub the environment was linked to; absent in copies saved before it was kept. */
+  linkedHub: Schema.optional(Schema.NullOr(BacklogLinkedHub)),
 });
 export type StoredBacklogBoard = typeof StoredBacklogBoard.Type;
 

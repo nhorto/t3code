@@ -5,15 +5,22 @@
  * hub when linked, since it is the fleet's default host; a project's existing
  * backlog here stays here. Everything one call touches must live on one home.
  *
+ * With a hub there is one Inbox for the fleet, the hub's: INBOX and INBOX-n
+ * name it, and an Inbox left on this machine is legacy. Its issues stay
+ * reachable by id until moveInboxToHub re-creates them on the hub.
+ *
  * While the hub is unreachable, reads answer from the last snapshot of it
  * (BacklogHubSnapshot) and say so with `stale: true` and `asOf`; writes fail
  * with code unavailable. A backlog that moved away from this machine answers
  * with where it went, or is followed to the hub when it moved there.
  *
- * Clients do not route: they connect to every environment directly.
+ * Clients do not route: they connect to every environment directly. They read
+ * this machine's board through `subscribe`, which says which hub it is linked to.
  */
 import {
+  BACKLOG_INBOX_KEY,
   BacklogError,
+  isBacklogStatusClosed,
   type Backlog,
   type BacklogActivity,
   type BacklogActor,
@@ -26,8 +33,10 @@ import {
   type BacklogIssueStatus,
   type BacklogIssueType,
   type BacklogListIssuesInput,
+  type BacklogMoveInboxToHubResult,
   type BacklogReleaseStatus,
   type BacklogRepositoryTarget,
+  type BacklogStreamEvent,
   type EnvironmentId,
   parseBacklogIssueKey,
   type ProjectId,
@@ -36,6 +45,8 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Semaphore from "effect/Semaphore";
+import * as Stream from "effect/Stream";
 
 import * as ProjectService from "../project/ProjectService.ts";
 import { localBacklogHome, type BacklogHome } from "./BacklogHome.ts";
@@ -168,6 +179,20 @@ export class BacklogRouter extends Context.Service<
       input: { readonly url: string; readonly issue?: string | undefined },
       actor: BacklogActor,
     ) => Effect.Effect<ReadonlyArray<BacklogIssue>, BacklogError>;
+    /**
+     * This machine's board stream for clients: the service's, with each
+     * snapshot naming the hub this machine is linked to, and a new snapshot
+     * whenever the link changes.
+     */
+    readonly subscribe: () => Stream.Stream<BacklogStreamEvent, BacklogError>;
+    /**
+     * Re-creates each open issue of this machine's legacy Inbox on the hub's
+     * Inbox and closes it here as wontfix, noting where it went. Issues an
+     * agent holds stay until released. Only while linked.
+     */
+    readonly moveInboxToHub: (
+      actor: BacklogActor,
+    ) => Effect.Effect<BacklogMoveInboxToHubResult, BacklogError>;
   }
 >()("t3/backlog/BacklogRouter") {}
 
@@ -194,6 +219,23 @@ const withHost =
   (host: BacklogHost) =>
   <A extends object>(rows: ReadonlyArray<A>): ReadonlyArray<A & { readonly host: BacklogHost }> =>
     rows.map((row) => ({ ...row, host }));
+
+const isInboxRef = (ref: string) => ref.trim().toUpperCase() === BACKLOG_INBOX_KEY;
+
+/** Parents before their children, so a moved child can point at its moved parent. */
+const parentsFirst = (issues: ReadonlyArray<BacklogIssue>) => {
+  const byId = new Map(issues.map((issue) => [issue.id, issue]));
+  const depth = (issue: BacklogIssue) => {
+    let levels = 0;
+    for (let parent = issue.parentId; parent !== null && levels < issues.length; levels++) {
+      const above = byId.get(parent);
+      if (above === undefined) break;
+      parent = above.parentId;
+    }
+    return levels;
+  };
+  return issues.toSorted((left, right) => depth(left) - depth(right) || left.number - right.number);
+};
 
 const backlogMatches = (backlog: Backlog, ref: string) =>
   backlog.id === ref.trim() || backlog.key === ref.trim().toUpperCase();
@@ -281,8 +323,23 @@ export const make = Effect.gen(function* () {
       }
     });
 
-  /** Local first, then the hub. A key found on both is ambiguous. */
+  /**
+   * Local first, then the hub. A key found on both is ambiguous, except
+   * INBOX-n: with a hub it is always the hub's.
+   */
   const resolveIssue = (ref: string) =>
+    Effect.gen(function* () {
+      if (parseBacklogIssueKey(ref)?.backlogKey === BACKLOG_INBOX_KEY) {
+        const linked = yield* hub;
+        if (Option.isSome(linked)) {
+          const target = linked.value;
+          return { target, id: yield* target.home.resolveIssue(ref) };
+        }
+      }
+      return yield* resolveIssueHereOrOnHub(ref);
+    });
+
+  const resolveIssueHereOrOnHub = (ref: string) =>
     local.home.resolveIssue(ref).pipe(
       Effect.tap((id) =>
         parseBacklogIssueKey(ref) === null
@@ -328,7 +385,28 @@ export const make = Effect.gen(function* () {
       ),
     );
 
+  /** Like resolveIssue: INBOX is the hub's Inbox while linked. */
   const resolveBacklog = (ref: string) =>
+    Effect.gen(function* () {
+      if (isInboxRef(ref)) {
+        const linked = yield* hub;
+        if (Option.isSome(linked)) {
+          const target = linked.value;
+          const inbox = (yield* target.home.listBacklogs()).find(
+            (backlog) => backlog.kind === "inbox",
+          );
+          if (inbox === undefined) {
+            return yield* notFound(
+              `${target.label} has no Inbox yet. Create an issue without a backlog to start it.`,
+            );
+          }
+          return { target, backlogId: inbox.id };
+        }
+      }
+      return yield* resolveBacklogHereOrOnHub(ref);
+    });
+
+  const resolveBacklogHereOrOnHub = (ref: string) =>
     service.resolveBacklogRef(ref).pipe(
       Effect.tap((backlog) =>
         backlog.id === ref.trim()
@@ -473,7 +551,11 @@ export const make = Effect.gen(function* () {
   const listBacklogs: BacklogRouter["Service"]["listBacklogs"] = () =>
     tracked(
       Effect.gen(function* () {
-        const own = yield* service.listBacklogs();
+        const linked = Option.isSome(yield* hub);
+        // A linked machine's own Inbox is legacy; INBOX names the hub's.
+        const own = (yield* service.listBacklogs()).filter(
+          (backlog) => !(linked && backlog.kind === "inbox"),
+        );
         const remote = yield* listOnHub((target) => target.home.listBacklogs());
         return {
           backlogs: [...withHost("local")(own), ...withHost("hub")(remote.rows)],
@@ -514,7 +596,11 @@ export const make = Effect.gen(function* () {
           const { target } = yield* resolveIssue(input.parent);
           return yield* scoped(target, undefined);
         }
-        const own = yield* local.home.listIssues(filters);
+        // Legacy Inbox issues would read as the hub's INBOX-n; they stay reachable by id.
+        const own = yield* service.listIssues({
+          ...filters,
+          excludeInbox: Option.isSome(yield* hub),
+        });
         const remote = yield* listOnHub((target) => target.home.listIssues(filters));
         return {
           issues: [...withHost("local")(own), ...withHost("hub")(remote.rows)],
@@ -540,30 +626,33 @@ export const make = Effect.gen(function* () {
   ) =>
     Effect.gen(function* () {
       const placed =
-        backlog !== undefined
-          ? yield* resolveBacklog(backlog).pipe(
-              Effect.map(({ target, backlogId }) => ({ target, where: { backlogId } })),
-            )
-          : projectId !== undefined
-            ? yield* placeProjectForCreate(projectId).pipe(
-                Effect.map((placement) => ({
-                  target: placement.target,
-                  where: placementInput(placement),
-                })),
+        backlog !== undefined && isInboxRef(backlog)
+          ? // The Inbox host creates its Inbox on first use.
+            { target: yield* defaultTarget, where: {} }
+          : backlog !== undefined
+            ? yield* resolveBacklog(backlog).pipe(
+                Effect.map(({ target, backlogId }) => ({ target, where: { backlogId } })),
               )
-            : parent !== undefined
-              ? // A child with no other target joins its parent's backlog.
-                yield* resolveIssue(parent).pipe(
-                  Effect.flatMap(({ target, id }) =>
-                    target.home.getIssue({ issueId: id }).pipe(
-                      Effect.map((detail) => ({
-                        target,
-                        where: { backlogId: detail.issue.backlogId },
-                      })),
-                    ),
-                  ),
+            : projectId !== undefined
+              ? yield* placeProjectForCreate(projectId).pipe(
+                  Effect.map((placement) => ({
+                    target: placement.target,
+                    where: placementInput(placement),
+                  })),
                 )
-              : { target: yield* defaultTarget, where: {} };
+              : parent !== undefined
+                ? // A child with no other target joins its parent's backlog.
+                  yield* resolveIssue(parent).pipe(
+                    Effect.flatMap(({ target, id }) =>
+                      target.home.getIssue({ issueId: id }).pipe(
+                        Effect.map((detail) => ({
+                          target,
+                          where: { backlogId: detail.issue.backlogId },
+                        })),
+                      ),
+                    ),
+                  )
+                : { target: yield* defaultTarget, where: {} };
       const { target, where } = placed;
       return yield* target.home.createIssue(
         {
@@ -662,9 +751,13 @@ export const make = Effect.gen(function* () {
       if (input.parent !== undefined) {
         return yield* claimIn((yield* resolveIssue(input.parent)).target, undefined);
       }
-      const here = yield* claimIn(local, undefined);
-      if (here !== null) return here;
       const linked = yield* hub;
+      const here = yield* service
+        .claimNext({ type: input.type, excludeInbox: Option.isSome(linked) }, actor)
+        .pipe(
+          Effect.map((claimed) => (claimed === null ? null : { ...claimed, ...hostOf(local) })),
+        );
+      if (here !== null) return here;
       return Option.isNone(linked) ? null : yield* claimIn(linked.value, undefined);
     });
 
@@ -696,6 +789,76 @@ export const make = Effect.gen(function* () {
           return [...own, ...remote.rows];
         });
 
+  const subscribe: BacklogRouter["Service"]["subscribe"] = () =>
+    hubClient.linkedHubChanges.pipe(
+      Stream.changesWith(
+        (left, right) =>
+          Option.getOrNull(left)?.environmentId === Option.getOrNull(right)?.environmentId &&
+          Option.getOrNull(left)?.label === Option.getOrNull(right)?.label,
+      ),
+      Stream.switchMap((linked) =>
+        service
+          .subscribe()
+          .pipe(
+            Stream.map((event): BacklogStreamEvent =>
+              event.type === "snapshot" ? { ...event, linkedHub: Option.getOrNull(linked) } : event,
+            ),
+          ),
+      ),
+    );
+
+  const moveLock = yield* Semaphore.make(1);
+  const moveInboxToHub: BacklogRouter["Service"]["moveInboxToHub"] = (actor) =>
+    moveLock.withPermits(1)(
+      Effect.gen(function* () {
+        const linked = yield* hub;
+        if (Option.isNone(linked)) {
+          return yield* invalid(
+            "This machine is not linked to a hub; its Inbox is the one in use.",
+          );
+        }
+        const target = linked.value;
+        const inbox = (yield* service.listBacklogs()).find((backlog) => backlog.kind === "inbox");
+        const open =
+          inbox === undefined
+            ? []
+            : (yield* service.listIssues({ backlogId: inbox.id })).filter(
+                (issue) => !isBacklogStatusClosed(issue.status),
+              );
+        const movedIds = new Map<string, BacklogIssue["id"]>();
+        const moved: Array<{ from: string; to: string }> = [];
+        const skipped: string[] = [];
+        for (const issue of parentsFirst(open)) {
+          if (issue.claim !== null) {
+            skipped.push(issue.key);
+            continue;
+          }
+          const { body } = yield* service.getIssue({ issueId: issue.id });
+          const parentId = issue.parentId === null ? undefined : movedIds.get(issue.parentId);
+          const created = yield* target.home.createIssue(
+            {
+              title: issue.title,
+              body,
+              type: issue.type,
+              status: issue.status,
+              priority: issue.priority,
+              ...(parentId === undefined ? {} : { parentId }),
+            },
+            actor,
+          );
+          movedIds.set(issue.id, created.id);
+          // Closed before the note, so a failure between them never leaves a duplicate open.
+          yield* service.updateIssue({ issueId: issue.id, status: "wontfix" }, actor);
+          yield* service.comment(
+            { issueId: issue.id, text: `Moved to ${target.label} Inbox as ${created.key}.` },
+            actor,
+          );
+          moved.push({ from: issue.key, to: created.key });
+        }
+        return { hub: target.label, moved, skipped };
+      }),
+    );
+
   return BacklogRouter.of({
     listBacklogs,
     listIssues,
@@ -708,13 +871,30 @@ export const make = Effect.gen(function* () {
     release,
     comment,
     linkPullRequest,
+    subscribe,
+    moveInboxToHub,
   });
 });
 
 export const layer = Layer.effect(BacklogRouter, make);
 
+/**
+ * One Inbox per fleet: an unlinked machine creates its own at startup, while a
+ * machine linked to a hub uses the hub's and creates none.
+ */
+export const inboxLayer = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const hubClient = yield* BacklogHubClient.BacklogHubClient;
+    const service = yield* BacklogService.BacklogService;
+    if (Option.isSome(yield* hubClient.linkedHub)) return;
+    yield* service
+      .ensureInbox()
+      .pipe(Effect.catch((cause) => Effect.logWarning("Could not create the Inbox", { cause })));
+  }),
+);
+
 /** The router with the hub link and its lease renewal, for the server runtime. */
-export const fleetLayer = Layer.mergeAll(layer, BacklogHubClient.renewalLayer).pipe(
+export const fleetLayer = Layer.mergeAll(layer, BacklogHubClient.renewalLayer, inboxLayer).pipe(
   Layer.provideMerge(BacklogHubClient.layer),
   Layer.provideMerge(BacklogHubSnapshot.layer),
 );

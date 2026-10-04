@@ -2082,7 +2082,7 @@ const makeWsRpcLayer = (
             "scheduled_task.id": input.id,
           }),
         [WS_METHODS.backlogSubscribe]: (_input) =>
-          observeRpcStream(WS_METHODS.backlogSubscribe, backlog.subscribe(), {
+          observeRpcStream(WS_METHODS.backlogSubscribe, backlogRouter.subscribe(), {
             "rpc.aggregate": "backlog",
           }),
         [WS_METHODS.backlogGetIssue]: (input) =>
@@ -2093,10 +2093,10 @@ const makeWsRpcLayer = (
         [WS_METHODS.backlogCreateIssue]: (input) =>
           observeRpcEffect(
             WS_METHODS.backlogCreateIssue,
-            // A client naming only a project lets the router place the issue, so a linked
-            // spoke without its own board for the repository files it on the hub's.
-            input.projectId !== undefined &&
-              input.backlogId === undefined &&
+            // A client naming only a project, or nothing (the Inbox), lets the router place
+            // the issue, so a linked spoke files it on the hub's board or the hub's Inbox.
+            input.backlogId === undefined &&
+              input.repository === undefined &&
               input.actor === undefined
               ? backlogRouter.createIssue(
                   {
@@ -2217,6 +2217,12 @@ const makeWsRpcLayer = (
           observeRpcEffect(
             WS_METHODS.backlogRestoreBacklog,
             backlog.restoreBacklog(input.backlogId),
+            { "rpc.aggregate": "backlog" },
+          ),
+        [WS_METHODS.backlogMoveInboxToHub]: (_input) =>
+          observeRpcEffect(
+            WS_METHODS.backlogMoveInboxToHub,
+            backlogRouter.moveInboxToHub(backlogUser),
             { "rpc.aggregate": "backlog" },
           ),
         [WS_METHODS.agentMessagesSubscribe]: (_input) =>

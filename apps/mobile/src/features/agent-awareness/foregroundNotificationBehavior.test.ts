@@ -2,7 +2,7 @@ import type { Notification } from "expo-notifications";
 import { describe, expect, it } from "vite-plus/test";
 
 import { foregroundNotificationBehavior } from "./foregroundNotificationBehavior";
-import { threadDeepLinkOnScreen } from "./notificationPayload";
+import { notificationDeepLinkOnScreen, threadDeepLinkOnScreen } from "./notificationPayload";
 
 function notificationWithData(data: Record<string, unknown>): Notification {
   return {
@@ -26,7 +26,30 @@ describe("threadDeepLinkOnScreen", () => {
   });
 });
 
+describe("notificationDeepLinkOnScreen", () => {
+  it("maps the Messages screen and threads, nothing else", () => {
+    expect(notificationDeepLinkOnScreen("/backlog/messages")).toBe("/backlog/messages");
+    expect(notificationDeepLinkOnScreen("/threads/env-1/thread-1/git")).toBe(
+      "/threads/env-1/thread-1",
+    );
+    expect(notificationDeepLinkOnScreen("/backlog")).toBeNull();
+  });
+});
+
 describe("foregroundNotificationBehavior", () => {
+  it("suppresses a held message alert while the Messages screen is open", () => {
+    const alert = notificationWithData({
+      deepLink: "/backlog/messages",
+      environmentId: "env-1",
+      threadId: "thread-1",
+    });
+    expect(foregroundNotificationBehavior(alert, "/backlog/messages").shouldShowBanner).toBe(false);
+    // The receiving thread being open does not make the alert redundant.
+    expect(foregroundNotificationBehavior(alert, "/threads/env-1/thread-1").shouldShowBanner).toBe(
+      true,
+    );
+  });
+
   it("suppresses a notification for the thread already on screen", () => {
     const behavior = foregroundNotificationBehavior(
       notificationWithData({ environmentId: "env-1", threadId: "thread-1" }),

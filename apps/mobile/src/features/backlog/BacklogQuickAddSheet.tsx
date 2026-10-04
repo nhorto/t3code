@@ -76,7 +76,9 @@ export function BacklogQuickAddSheet({
     label: "backlog quick add",
     reportFailure: false,
   });
-  const pickerScopes = scopes.filter((scope) => scope.kind !== "all");
+  const pickerScopes = scopes.filter(
+    (scope) => scope.kind !== "all" && scope.kind !== "legacyInbox",
+  );
   // Projects load after the sheet opens, so a requested project resolves lazily.
   const scope = resolveBacklogScope(
     pickerScopes,

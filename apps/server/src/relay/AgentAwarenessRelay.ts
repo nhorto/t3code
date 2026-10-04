@@ -7,9 +7,12 @@ import type {
   ThreadId,
 } from "@t3tools/contracts";
 import {
+  RELAY_HELD_AGENT_MESSAGES_DEEP_LINK,
   RelayApi,
   type RelayAgentActivityPublishProofPayload,
   type RelayAgentActivityState,
+  type RelayHeldAgentMessageNotification,
+  type RelayHeldAgentMessagePublishProofPayload,
 } from "@t3tools/contracts/relay";
 import { projectThreadAwarenessV2 } from "@t3tools/shared/agentAwareness";
 import { turnItemUpdateCanEndBackgroundWork } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
@@ -18,6 +21,7 @@ import { withRelayClientTracing } from "@t3tools/shared/relayTracing";
 import {
   normalizeRelayIssuer,
   RELAY_ACTIVITY_PUBLISH_TYP,
+  RELAY_HELD_MESSAGE_PUBLISH_TYP,
   signRelayJwt,
 } from "@t3tools/shared/relayJwt";
 import * as Cause from "effect/Cause";
@@ -51,10 +55,21 @@ import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.t
 import * as ProjectService from "../project/ProjectService.ts";
 import { forkParked } from "../serverActivation.ts";
 
+/** A held agent message alert, before the relay publisher stamps where it came from. */
+export type HeldAgentMessageAlert = Omit<
+  RelayHeldAgentMessageNotification,
+  "environmentId" | "deepLink"
+>;
+
 export class AgentAwarenessRelay extends Context.Service<
   AgentAwarenessRelay,
   {
     readonly publishThread: (threadId: ThreadId) => Effect.Effect<void>;
+    /**
+     * Alerts the user's phones that agent messages are held here. One shot: a
+     * failure is logged, not retried. Skipped while publishing is off or unlinked.
+     */
+    readonly publishHeldAgentMessage: (alert: HeldAgentMessageAlert) => Effect.Effect<void>;
     readonly drain: Effect.Effect<void>;
     /** Retries a pending catch-up publish now. Call after this process links or enables publishing. */
     readonly requestCatchUp: () => Effect.Effect<void>;
@@ -273,6 +288,33 @@ const makePublishProof = Effect.fn("makePublishProof")(function* (input: {
   return yield* signRelayAgentActivityPublishProof({ privateKey: input.privateKey, payload });
 });
 
+const makeHeldMessagePublishProof = Effect.fn("makeHeldMessagePublishProof")(function* (input: {
+  readonly privateKey: string;
+  readonly relayIssuer: string;
+  readonly notification: RelayHeldAgentMessageNotification;
+  readonly jti: string;
+}) {
+  const now = yield* DateTime.now;
+  const expiresAt = DateTime.add(now, { minutes: 5 });
+  const environmentId = input.notification.environmentId;
+  const payload = {
+    iss: `t3-env:${environmentId}`,
+    aud: normalizeRelayIssuer(input.relayIssuer),
+    sub: environmentId,
+    jti: input.jti,
+    iat: Math.floor(now.epochMilliseconds / 1_000),
+    exp: Math.floor(expiresAt.epochMilliseconds / 1_000),
+    environmentId,
+    threadId: input.notification.threadId,
+    notification: input.notification,
+  } satisfies RelayHeldAgentMessagePublishProofPayload;
+  return yield* signRelayJwt({
+    privateKey: input.privateKey,
+    typ: RELAY_HELD_MESSAGE_PUBLISH_TYP,
+    payload,
+  });
+});
+
 // Compact, log-safe view of the fields the awareness phase ladder reads.
 function describeThreadShellForAwareness(
   thread: Option.Option<OrchestrationV2ThreadShell>,
@@ -374,6 +416,8 @@ export const make = Effect.gen(function* () {
   const scope = yield* Effect.scope;
   const cloudLinkKeyPair = yield* getOrCreateEnvironmentKeyPairFromSecretStore(secrets);
   const startedAt = (yield* DateTime.now).epochMilliseconds;
+  // Held message alerts run on the caller's fiber, not the publish worker's.
+  const fetch = yield* FetchHttpClient.Fetch;
   const activeSnapshotPublishedRef = yield* Ref.make(false);
   // Holds at most one pending wake, so a burst of requests costs one retry.
   const catchUpRequests = yield* Queue.dropping<void>(1);
@@ -837,8 +881,60 @@ export const make = Effect.gen(function* () {
     },
   );
 
+  const publishHeldAgentMessage: AgentAwarenessRelay["Service"]["publishHeldAgentMessage"] = (
+    alert,
+  ) =>
+    Effect.gen(function* () {
+      if (!(yield* readPublishAgentActivityEnabled)) {
+        yield* Effect.logDebug("held agent message alert skipped; publication disabled");
+        return;
+      }
+      const relayConfig = yield* readRelayConfig;
+      if (!relayConfig) {
+        yield* Effect.logDebug("held agent message alert skipped; relay link unavailable");
+        return;
+      }
+      const environmentId = yield* serverEnvironment.getEnvironmentId;
+      const notification: RelayHeldAgentMessageNotification = {
+        ...alert,
+        environmentId,
+        deepLink: RELAY_HELD_AGENT_MESSAGES_DEEP_LINK,
+      };
+      const proof = yield* makeHeldMessagePublishProof({
+        privateKey: cloudLinkKeyPair.privateKey,
+        relayIssuer: relayConfig.issuer,
+        notification,
+        jti: yield* crypto.randomUUIDv4,
+      });
+      const relayClient = yield* makeRelayClient(relayConfig).pipe(
+        Effect.provideService(FetchHttpClient.Fetch, fetch),
+      );
+      const response = yield* relayClient.server.publishHeldAgentMessage({
+        params: { environmentId, threadId: alert.threadId },
+        payload: { notification, proof },
+      });
+      yield* Effect.logInfo("held agent message alert published", {
+        environmentId,
+        threadId: alert.threadId,
+        count: alert.count,
+        deliveries: deliveryStats(response.deliveries),
+      });
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.void
+          : Effect.logWarning("held agent message alert failed", {
+              threadId: alert.threadId,
+              cause: Cause.pretty(cause),
+            }),
+      ),
+      Effect.withSpan("AgentAwarenessRelay.publishHeldAgentMessage"),
+      withRelayClientTracing,
+    );
+
   return AgentAwarenessRelay.of({
     publishThread,
+    publishHeldAgentMessage,
     drain: worker.drain,
     requestCatchUp: () => Queue.offer(catchUpRequests, undefined).pipe(Effect.asVoid),
     start,

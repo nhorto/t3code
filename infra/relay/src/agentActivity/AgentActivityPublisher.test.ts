@@ -1,4 +1,8 @@
-import type { RelayAgentActivityState, RelayDeliveryResult } from "@t3tools/contracts/relay";
+import type {
+  RelayAgentActivityState,
+  RelayDeliveryResult,
+  RelayHeldAgentMessageNotification,
+} from "@t3tools/contracts/relay";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -14,6 +18,7 @@ const publisherLayer = AgentActivityPublisher.layer.pipe(
   Layer.provide(
     Layer.succeed(FcmDeliveries.FcmDeliveries, {
       enqueue: () => Effect.succeed(null),
+      enqueueHeldAgentMessage: () => Effect.succeed(null),
       process: () => Effect.void,
     }),
   ),
@@ -105,6 +110,7 @@ function makeApnsDeliveries(
   return {
     sendForTarget: () => Effect.succeed(null),
     sendPushNotificationForTarget: () => Effect.succeed(null),
+    sendHeldAgentMessageForTarget: () => Effect.succeed(null),
     sendLiveActivity: () =>
       Effect.succeed({
         deviceId: "device",
@@ -184,6 +190,95 @@ describe("AgentActivityPublisher", () => {
                 enqueue: (input) =>
                   Effect.sync(() => {
                     fcmCalls.push(input);
+                    return null;
+                  }),
+                enqueueHeldAgentMessage: () => Effect.succeed(null),
+                process: () => Effect.void,
+              }),
+            ),
+          ),
+        ),
+      ),
+    );
+  });
+
+  it.effect("alerts every device of users who take notifications when messages are held", () => {
+    const android = { ...target("android"), platform: "android" as const, ios_major_version: null };
+    const ios = target("ios");
+    const notification: RelayHeldAgentMessageNotification = {
+      environmentId: state.environmentId,
+      threadId: state.threadId,
+      title: "Agent message held: Codex → Claude",
+      body: "Can you rerun the tests?",
+      count: 1,
+      messageId: "message-1",
+      deepLink: "/backlog/messages",
+    };
+    const fcmDevices: string[] = [];
+    const appleDevices: string[] = [];
+    const targetReads: string[] = [];
+    return Effect.gen(function* () {
+      const publisher = yield* AgentActivityPublisher.AgentActivityPublisher;
+      yield* publisher.publishHeldAgentMessage({
+        environmentId: state.environmentId,
+        environmentPublicKey: "key",
+        notification,
+      });
+      expect(fcmDevices).toEqual(["android"]);
+      expect(appleDevices).toEqual(["ios"]);
+      // A user who turned notifications off for the environment is never looked up.
+      expect(targetReads).toEqual(["dev:julius"]);
+    }).pipe(
+      Effect.provide(
+        AgentActivityPublisher.layer.pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              Layer.succeed(AgentActivityRows.AgentActivityRows, makeAgentActivityRows()),
+              Layer.succeed(
+                EnvironmentLinks.EnvironmentLinks,
+                makeEnvironmentLinks({
+                  listDeliveryUsersForEnvironment: () =>
+                    Effect.succeed([
+                      {
+                        userId: "dev:julius",
+                        notificationsEnabled: true,
+                        liveActivitiesEnabled: false,
+                      },
+                      {
+                        userId: "dev:theo",
+                        notificationsEnabled: false,
+                        liveActivitiesEnabled: true,
+                      },
+                    ]),
+                }),
+              ),
+              Layer.succeed(
+                LiveActivities.LiveActivities,
+                makeLiveActivities({
+                  listTargets: ({ userId }) =>
+                    Effect.sync(() => {
+                      targetReads.push(userId);
+                      return [android, ios];
+                    }),
+                }),
+              ),
+              Layer.succeed(
+                ApnsDeliveries.ApnsDeliveries,
+                makeApnsDeliveries({
+                  sendHeldAgentMessageForTarget: (input) =>
+                    Effect.sync(() => {
+                      expect(input.notification).toEqual(notification);
+                      appleDevices.push(input.target.device_id);
+                      return null;
+                    }),
+                }),
+              ),
+              Layer.succeed(FcmDeliveries.FcmDeliveries, {
+                enqueue: () => Effect.die("activity state is not published"),
+                enqueueHeldAgentMessage: (input) =>
+                  Effect.sync(() => {
+                    expect(input.notification).toEqual(notification);
+                    fcmDevices.push(input.target.device_id);
                     return null;
                   }),
                 process: () => Effect.void,

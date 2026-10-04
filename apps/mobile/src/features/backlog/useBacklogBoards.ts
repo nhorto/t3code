@@ -130,8 +130,8 @@ export function useBacklogBoards() {
     [grouping, projects],
   );
   const scopes = useMemo(
-    () => buildBacklogScopes({ boards, projectGroups }),
-    [boards, projectGroups],
+    () => buildBacklogScopes({ boards, projectGroups, environmentLabel }),
+    [boards, environmentLabel, projectGroups],
   );
   const issuesById = useMemo(() => mergeBacklogIssuesById(boards), [boards]);
   const unsupportedIds = useMemo(

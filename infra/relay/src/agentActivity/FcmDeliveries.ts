@@ -3,6 +3,7 @@ import {
   RelayAgentActivityState,
   RelayAgentActivityAggregateState,
   RelayAgentAwarenessPreferences,
+  RelayHeldAgentMessageNotification,
   type RelayDeliveryResult,
 } from "@t3tools/contracts/relay";
 import * as Crypto from "effect/Crypto";
@@ -39,6 +40,8 @@ export const FcmDeliveryJob = Schema.Struct({
   state: Schema.NullOr(RelayAgentActivityState),
   queuedAt: Schema.Number,
   replay: Schema.optional(Schema.Boolean),
+  /** A one-shot held agent message alert; `state` is null and the activity card is untouched. */
+  heldAgentMessage: Schema.optional(RelayHeldAgentMessageNotification),
 });
 export type FcmDeliveryJob = typeof FcmDeliveryJob.Type;
 const decodeJob = Schema.decodeUnknownEffect(FcmDeliveryJob);
@@ -115,6 +118,28 @@ export function androidAlertForAggregate(input: {
   };
 }
 
+/** Android data for a held agent message alert; the native handler only posts the alert. */
+export function androidHeldAgentMessageData(notification: RelayHeldAgentMessageNotification) {
+  return {
+    t3_kind: "agent_alert",
+    // Hashed before sending. Queue retries carry the same id, and the native handler deduplicates it.
+    alert_id: JSON.stringify([
+      notification.environmentId,
+      notification.threadId,
+      notification.messageId,
+      notification.count,
+    ]),
+    alert_group: JSON.stringify([
+      "held-agent-messages",
+      notification.environmentId,
+      notification.threadId,
+    ]),
+    alert_title: notification.title,
+    alert_body: notification.body,
+    alert_path: notification.deepLink,
+  };
+}
+
 export class FcmDeliveries extends Context.Service<
   FcmDeliveries,
   {
@@ -122,6 +147,10 @@ export class FcmDeliveries extends Context.Service<
       readonly target: LiveActivities.TargetRow;
       readonly state: RelayAgentActivityState | null;
       readonly replay?: boolean;
+    }) => Effect.Effect<RelayDeliveryResult | null, FcmDeliveryError>;
+    readonly enqueueHeldAgentMessage: (input: {
+      readonly target: LiveActivities.TargetRow;
+      readonly notification: RelayHeldAgentMessageNotification;
     }) => Effect.Effect<RelayDeliveryResult | null, FcmDeliveryError>;
     readonly process: (
       body: unknown,
@@ -149,40 +178,120 @@ export const make = Effect.gen(function* () {
   const links = yield* EnvironmentLinks.EnvironmentLinks;
   const db = yield* RelayDb.RelayDb;
 
-  return FcmDeliveries.of({
-    enqueue: Effect.fn("relay.fcm.enqueue")(function* (input) {
-      if (input.target.platform !== "android" || !input.target.push_token) return null;
-      if (!config.fcmServiceAccount) {
-        yield* Effect.logWarning("Android notifications are not configured for this relay");
-        return {
-          deviceId: input.target.device_id,
-          kind: "push_notification",
-          ok: false,
-          apnsStatus: null,
-          apnsReason: null,
-          apnsId: null,
-        };
-      }
-      const now = yield* DateTime.now;
-      yield* sender
-        .send({
-          userId: input.target.user_id,
-          deviceId: input.target.device_id,
-          token: input.target.push_token,
-          state: input.state,
-          ...(input.replay ? { replay: true } : {}),
-          queuedAt: now.epochMilliseconds,
-        })
-        .pipe(Effect.mapError((cause) => new FcmDeliveryError({ operation: "enqueue", cause })));
+  const enqueueJob = Effect.fnUntraced(function* (input: {
+    readonly target: LiveActivities.TargetRow;
+    readonly state: RelayAgentActivityState | null;
+    readonly replay?: boolean;
+    readonly heldAgentMessage?: RelayHeldAgentMessageNotification;
+  }) {
+    if (input.target.platform !== "android" || !input.target.push_token) return null;
+    if (!config.fcmServiceAccount) {
+      yield* Effect.logWarning("Android notifications are not configured for this relay");
       return {
         deviceId: input.target.device_id,
         kind: "push_notification",
-        ok: true,
-        queued: true,
+        ok: false,
         apnsStatus: null,
         apnsReason: null,
         apnsId: null,
-      };
+      } satisfies RelayDeliveryResult;
+    }
+    const now = yield* DateTime.now;
+    yield* sender
+      .send({
+        userId: input.target.user_id,
+        deviceId: input.target.device_id,
+        token: input.target.push_token,
+        state: input.state,
+        ...(input.replay ? { replay: true } : {}),
+        ...(input.heldAgentMessage ? { heldAgentMessage: input.heldAgentMessage } : {}),
+        queuedAt: now.epochMilliseconds,
+      })
+      .pipe(Effect.mapError((cause) => new FcmDeliveryError({ operation: "enqueue", cause })));
+    return {
+      deviceId: input.target.device_id,
+      kind: "push_notification",
+      ok: true,
+      queued: true,
+      apnsStatus: null,
+      apnsReason: null,
+      apnsId: null,
+    } satisfies RelayDeliveryResult;
+  });
+
+  const invalidateToken = (job: FcmDeliveryJob) =>
+    db
+      .update(relayMobileDevices)
+      .set({ pushToken: null })
+      .where(
+        and(
+          eq(relayMobileDevices.userId, job.userId),
+          eq(relayMobileDevices.deviceId, job.deviceId),
+          eq(relayMobileDevices.pushToken, job.token),
+        ),
+      )
+      .pipe(
+        Effect.mapError((cause) => new FcmDeliveryError({ operation: "invalidate-token", cause })),
+      );
+
+  const hexDigest = (value: string) =>
+    crypto
+      .digest("SHA-256", new TextEncoder().encode(value))
+      .pipe(
+        Effect.map((digest) =>
+          Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join(""),
+        ),
+      );
+
+  /** Sends a held agent message alert if the user still takes alerts from its environment. */
+  const processHeldAgentMessage = Effect.fnUntraced(function* (input: {
+    readonly job: FcmDeliveryJob;
+    readonly notification: RelayHeldAgentMessageNotification;
+    readonly target: LiveActivities.TargetRow;
+    readonly nowMs: number;
+  }) {
+    const { job, notification } = input;
+    // Re-read the link when consuming: queued alerts must honor sign-out and
+    // notifications turned off for the environment.
+    const link = yield* links.getForUser({
+      userId: job.userId,
+      environmentId: notification.environmentId,
+    });
+    const deliveryUsers = link
+      ? yield* links.listDeliveryUsersForEnvironment({
+          environmentId: notification.environmentId,
+          environmentPublicKey: link.environmentPublicKey,
+        })
+      : [];
+    if (!deliveryUsers.some((user) => user.userId === job.userId && user.notificationsEnabled)) {
+      return;
+    }
+    const alert = androidHeldAgentMessageData(notification);
+    const result = yield* client.send({
+      token: job.token,
+      packageName: input.target.bundle_id,
+      alert: true,
+      data: fitFcmData({
+        device_id: job.deviceId,
+        user_id: job.userId,
+        updated_at: String(input.nowMs),
+        ...alert,
+        alert_id: yield* hexDigest(alert.alert_id),
+      }),
+    });
+    if (result.unregistered) yield* invalidateToken(job);
+  });
+
+  return FcmDeliveries.of({
+    enqueue: Effect.fn("relay.fcm.enqueue")(function* (input) {
+      return yield* enqueueJob(input);
+    }),
+    enqueueHeldAgentMessage: Effect.fn("relay.fcm.enqueue_held_agent_message")(function* (input) {
+      return yield* enqueueJob({
+        target: input.target,
+        state: null,
+        heldAgentMessage: input.notification,
+      });
     }),
     process: Effect.fn("relay.fcm.process")(function* (body) {
       const job = yield* decodeJob(body).pipe(
@@ -200,6 +309,15 @@ export const make = Effect.gen(function* () {
       if (!target) return;
       const preferences = decodePreferences(target.preferences_json);
       if (Option.isNone(preferences)) return;
+      if (job.heldAgentMessage) {
+        if (!preferences.value.notificationsEnabled) return;
+        return yield* processHeldAgentMessage({
+          job,
+          notification: job.heldAgentMessage,
+          target,
+          nowMs: now.epochMilliseconds,
+        });
+      }
 
       // Re-read links and state when consuming: queued messages must honor
       // sign-out, token rotation, disabled publishing, and newer thread states.
@@ -306,8 +424,7 @@ export const make = Effect.gen(function* () {
       if (alert) {
         // Group identities can contain five sets of IDs. Hash the full,
         // stable identity rather than spending the payload budget on it.
-        const digest = yield* crypto.digest("SHA-256", new TextEncoder().encode(alert.alert_id));
-        data.alert_id = Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+        data.alert_id = yield* hexDigest(alert.alert_id);
       }
       const result = yield* client.send({
         token: job.token,
@@ -316,21 +433,7 @@ export const make = Effect.gen(function* () {
         data: fitFcmData(data),
       });
       if (result.unregistered) {
-        yield* db
-          .update(relayMobileDevices)
-          .set({ pushToken: null })
-          .where(
-            and(
-              eq(relayMobileDevices.userId, job.userId),
-              eq(relayMobileDevices.deviceId, job.deviceId),
-              eq(relayMobileDevices.pushToken, job.token),
-            ),
-          )
-          .pipe(
-            Effect.mapError(
-              (cause) => new FcmDeliveryError({ operation: "invalidate-token", cause }),
-            ),
-          );
+        yield* invalidateToken(job);
       } else if (acknowledgeAggregate) {
         yield* devices.markDelivery({
           userId: job.userId,

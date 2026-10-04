@@ -1,14 +1,21 @@
 import { LegendList } from "@legendapp/list/react-native";
 import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
-import type { BacklogIssueStatus, BacklogIssueType } from "@t3tools/contracts";
+import {
+  isBacklogStatusClosed,
+  type BacklogIssueStatus,
+  type BacklogIssueType,
+  type EnvironmentId,
+} from "@t3tools/contracts";
 import { useCallback, useMemo, useState } from "react";
-import { ActivityIndicator, Pressable, View } from "react-native";
+import { ActivityIndicator, Alert, Pressable, View } from "react-native";
 
 import { AppText as Text } from "../../components/AppText";
 import { SymbolView } from "../../components/AppSymbol";
 import { ControlPillMenu } from "../../components/ControlPill";
 import { EmptyState } from "../../components/EmptyState";
 import { ScreenHeader } from "../../components/ScreenHeader";
+import { backlogEnvironment } from "../../state/backlog";
+import { useAtomCommand } from "../../state/use-atom-command";
 import { SettingsScreenContent } from "../settings/components/SettingsScreen";
 import {
   BACKLOG_TYPE_LABELS,
@@ -24,7 +31,7 @@ import {
   type BacklogListItem,
 } from "./backlog.logic";
 import { heldAgentMessagesSummary } from "./agentMessages.logic";
-import { BacklogIssueRow, BacklogSectionHeader } from "./backlog-components";
+import { alertBacklogFailure, BacklogIssueRow, BacklogSectionHeader } from "./backlog-components";
 import { useHeldAgentMessageCount } from "./useAgentMessages";
 import { useBacklogBoards, type BacklogEnvironmentNotice } from "./useBacklogBoards";
 
@@ -206,6 +213,19 @@ export function BacklogRouteScreen({ route }: StaticScreenProps<BacklogRoutePara
               scopeKey={scope.key}
               scopeLabel={scope.label}
               scopes={scopes}
+              legacyInbox={
+                scope.legacyInbox
+                  ? {
+                      ...scope.legacyInbox,
+                      machineLabel:
+                        environmentLabel(scope.legacyInbox.environmentId) ?? "This machine",
+                      openCount: scopeEntries.filter(
+                        ({ issue }) => !isBacklogStatusClosed(issue.status),
+                      ).length,
+                      writable: connectedEnvironmentIds.includes(scope.legacyInbox.environmentId),
+                    }
+                  : null
+              }
               notices={notices}
               unsupportedLabels={unsupportedLabels}
               loadingMore={isLoading && boards.length > 0}
@@ -226,6 +246,7 @@ function BacklogBoardHeader(props: {
   readonly scopeKey: string;
   readonly scopeLabel: string;
   readonly scopes: ReturnType<typeof useBacklogBoards>["scopes"];
+  readonly legacyInbox: LegacyInbox | null;
   readonly notices: ReadonlyArray<BacklogEnvironmentNotice>;
   readonly unsupportedLabels: ReadonlyArray<string>;
   readonly loadingMore: boolean;
@@ -265,6 +286,12 @@ function BacklogBoardHeader(props: {
           />
         </Pressable>
       </ControlPillMenu>
+      {props.legacyInbox ? (
+        <LegacyInboxBanner
+          legacyInbox={props.legacyInbox}
+          onEmptied={() => props.onSelectScope("inbox")}
+        />
+      ) : null}
       {props.heldMessageCount > 0 ? (
         <Pressable
           accessibilityRole="button"
@@ -317,6 +344,77 @@ function BacklogBoardHeader(props: {
       {props.loadingMore ? (
         <Text className="px-1 text-xs text-foreground-tertiary">Loading more environments…</Text>
       ) : null}
+    </View>
+  );
+}
+
+interface LegacyInbox {
+  readonly environmentId: EnvironmentId;
+  readonly hubLabel: string;
+  readonly machineLabel: string;
+  readonly openCount: number;
+  /** The machine is connected, so it can reach its hub. */
+  readonly writable: boolean;
+}
+
+/**
+ * An Inbox a machine kept from before it was linked to a hub. Moving re-creates each open issue
+ * on the hub's Inbox and closes it here with a note saying where it went.
+ */
+function LegacyInboxBanner(props: {
+  readonly legacyInbox: LegacyInbox;
+  readonly onEmptied: () => void;
+}) {
+  const { environmentId, hubLabel, machineLabel, openCount, writable } = props.legacyInbox;
+  const moveInbox = useAtomCommand(backlogEnvironment.moveInboxToHub, {
+    label: "backlog move inbox to hub",
+    reportFailure: false,
+  });
+  const [moving, setMoving] = useState(false);
+  const move = () => {
+    setMoving(true);
+    void moveInbox({ environmentId, input: {} })
+      .then((result) => {
+        if (alertBacklogFailure(`Could not move to the ${hubLabel} Inbox`, result)) return;
+        if (result._tag !== "Success") return;
+        const { skipped } = result.value;
+        if (skipped.length === 0) {
+          props.onEmptied();
+          return;
+        }
+        Alert.alert(
+          "Some issues stayed",
+          `${skipped.join(", ")} stayed: an agent holds ${skipped.length === 1 ? "it" : "them"}. Move again once released.`,
+        );
+      })
+      .finally(() => setMoving(false));
+  };
+  const issues = openCount === 1 ? "its open issue" : `its ${openCount} open issues`;
+  return (
+    <View className="gap-2 rounded-[16px] bg-subtle px-3 py-2.5">
+      <Text className="text-xs text-foreground-muted">
+        {`${machineLabel} is linked to ${hubLabel}, whose Inbox is the one for every machine. This is its old Inbox.`}
+      </Text>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`Move to ${hubLabel} Inbox`}
+        disabled={!writable || moving}
+        onPress={() =>
+          Alert.alert(
+            `Move to the ${hubLabel} Inbox?`,
+            `Moves ${issues}. Each is closed here as won't fix with a note saying where it went.`,
+            [
+              { text: "Cancel", style: "cancel" },
+              { text: "Move", onPress: move },
+            ],
+          )
+        }
+        className="self-start rounded-full bg-sheet px-3 py-1.5 active:opacity-70 disabled:opacity-50"
+      >
+        <Text className="text-xs font-t3-bold text-foreground">
+          {moving ? "Moving…" : `Move to ${hubLabel} Inbox`}
+        </Text>
+      </Pressable>
     </View>
   );
 }

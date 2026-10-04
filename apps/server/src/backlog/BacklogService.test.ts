@@ -39,10 +39,12 @@ const agent = (name: string): BacklogActor => ({
 const corkAndNote = ProjectId.make("project-cork");
 const coolNotes = ProjectId.make("project-cool");
 const corkAndNoteClone = ProjectId.make("project-cork-clone");
+const inboxNamed = ProjectId.make("project-inbox");
 const projects: Record<string, { title: string; canonicalKey?: string }> = {
   [corkAndNote]: { title: "Cork & Note", canonicalKey: "github.com/nhorto/cork-and-note" },
   [coolNotes]: { title: "Cool Notes" },
   [corkAndNoteClone]: { title: "Cork and Note", canonicalKey: "github.com/nhorto/cork-and-note" },
+  [inboxNamed]: { title: "Inbox" },
 };
 
 function projectShell(projectId: ProjectId) {
@@ -163,7 +165,6 @@ it.effect(
         assert.deepEqual(
           backlogs.map((entry) => [entry.key, entry.title, entry.repositoryKey]),
           [
-            ["INBOX", "Inbox", null],
             ["CN", "Cork & Note", "github.com/nhorto/cork-and-note"],
             ["CN2", "Cool Notes", null],
           ],
@@ -174,6 +175,31 @@ it.effect(
         assert.equal(missing.code, "not_found");
       }),
     ),
+);
+
+it.effect("creates the Inbox on first use and keeps its key for it", () =>
+  run(
+    Effect.gen(function* () {
+      const backlog = yield* BacklogService;
+      // Nothing creates an Inbox at startup: a machine linked to a hub uses the hub's.
+      assert.lengthOf(yield* backlog.listBacklogs(), 0);
+      const project = yield* backlog.createIssue({ projectId: inboxNamed, title: "Plan" }, user);
+      assert.equal(project.key, "INBOX2-1");
+
+      const idea = yield* backlog.createIssue({ title: "Idea" }, user);
+      assert.equal(idea.key, "INBOX-1");
+      const inbox = yield* backlog.ensureInbox();
+      assert.equal(inbox.id, idea.backlogId);
+      assert.deepEqual(
+        (yield* backlog.listBacklogs()).map((entry) => [entry.kind, entry.key]),
+        [
+          ["inbox", "INBOX"],
+          ["project", "INBOX2"],
+        ],
+      );
+      assert.lengthOf(yield* backlog.listIssues({ excludeInbox: true }), 1);
+    }),
+  ),
 );
 
 it.effect("records status changes and comments in the issue history", () =>
@@ -628,7 +654,7 @@ it.effect("streams a snapshot, then a delta for every changed row", () =>
         Stream.tap((event) =>
           event.type === "snapshot" ? Deferred.succeed(subscribed, undefined) : Effect.void,
         ),
-        Stream.take(4),
+        Stream.take(5),
         Stream.runCollect,
         Effect.forkChild,
       );
@@ -644,8 +670,10 @@ it.effect("streams a snapshot, then a delta for every changed row", () =>
             ? `backlog ${event.backlog.key}`
             : `issue ${event.issue.key}`;
       const events = Array.from(yield* Fiber.join(collected), describe);
+      // The Inbox is created by its first issue, and streams like any new backlog.
       assert.deepEqual(events, [
-        "snapshot 2 backlogs, CN-1",
+        "snapshot 1 backlogs, CN-1",
+        "backlog INBOX",
         `issue ${second.key}`,
         "backlog WINE",
         "issue WINE-1",
@@ -713,7 +741,7 @@ it.effect("leaves a read-only redirect behind that names where the board went", 
       yield* laptop.exportBacklog({ backlogId: issue.backlogId, to: toGeekom }),
     );
 
-    const [, redirect] = yield* laptop.listBacklogs();
+    const [redirect] = yield* laptop.listBacklogs();
     assert.equal(redirect?.movedTo?.label, "Geekom");
     // Clients still read the old copy; agents and every change are turned away.
     assert.equal((yield* laptop.getIssue({ issueId: issue.id })).issue.title, "Paywall");

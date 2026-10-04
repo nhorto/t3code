@@ -13,6 +13,12 @@ import {
 /** Lease length for an agent's claim; renewed while the claiming thread is alive. */
 export const BACKLOG_CLAIM_LEASE_MS = 15 * 60_000;
 
+/**
+ * The Inbox's key. With a fleet link there is one Inbox, on the hub, so INBOX
+ * and INBOX-n always name the hub's; no project backlog may take the key.
+ */
+export const BACKLOG_INBOX_KEY = "INBOX";
+
 export const BacklogIssueStatus = Schema.Literals([
   "inbox",
   "backlog",
@@ -213,11 +219,24 @@ export class BacklogError extends Schema.TaggedError<BacklogError>()("BacklogErr
 
 // Stream
 
+/** The hub an environment is linked to. */
+export const BacklogLinkedHub = Schema.Struct({
+  environmentId: EnvironmentId,
+  label: Schema.String,
+});
+export type BacklogLinkedHub = typeof BacklogLinkedHub.Type;
+
 export const BacklogStreamEvent = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("snapshot"),
     backlogs: Schema.Array(Backlog),
     issues: Schema.Array(BacklogIssue),
+    /**
+     * The hub this environment is linked to; its Inbox is the fleet's, and an
+     * Inbox here is a legacy one. Null or absent when unlinked. A new snapshot
+     * follows any change to the link.
+     */
+    linkedHub: Schema.optional(Schema.NullOr(BacklogLinkedHub)),
   }),
   Schema.Struct({ type: Schema.Literal("backlogUpserted"), backlog: Backlog }),
   Schema.Struct({ type: Schema.Literal("issueUpserted"), issue: BacklogIssue }),
@@ -446,6 +465,19 @@ export const BacklogHubLinkStatus = Schema.Struct({
   error: Schema.NullOr(Schema.Struct({ reason: BacklogUnavailableReason, message: Schema.String })),
 });
 export type BacklogHubLinkStatus = typeof BacklogHubLinkStatus.Type;
+
+/**
+ * Moving a linked machine's legacy Inbox to the hub's: each open issue is
+ * created again on the hub and closed here as wontfix with a note. Claimed
+ * issues stay behind until released.
+ */
+export const BacklogMoveInboxToHubResult = Schema.Struct({
+  hub: Schema.String,
+  moved: Schema.Array(Schema.Struct({ from: TrimmedNonEmptyString, to: TrimmedNonEmptyString })),
+  /** Keys left here because an agent holds them. */
+  skipped: Schema.Array(TrimmedNonEmptyString),
+});
+export type BacklogMoveInboxToHubResult = typeof BacklogMoveInboxToHubResult.Type;
 
 export const BacklogLinkHubInput = Schema.Struct({
   pairingUrl: TrimmedNonEmptyString.annotate({

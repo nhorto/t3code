@@ -1,5 +1,6 @@
 import {
   BACKLOG_CLAIM_LEASE_MS,
+  BACKLOG_INBOX_KEY,
   Backlog,
   BacklogActivity,
   BacklogActor,
@@ -87,7 +88,6 @@ export function isThreadHoldingClaims(
   return nowMs - lastActiveMs <= CLAIM_IDLE_GRACE_MS;
 }
 
-const INBOX_KEY = "INBOX";
 const LEASE_KEEPER_ACTOR: BacklogActor = {
   kind: "system",
   environmentId: null,
@@ -96,11 +96,16 @@ const LEASE_KEEPER_ACTOR: BacklogActor = {
 };
 
 // The inputs live in contracts because a linked server sends them over the wire.
-export type BacklogIssueFilters = BacklogListIssuesInput;
+export type BacklogIssueFilters = BacklogListIssuesInput & {
+  /** Leaves out the Inbox: a machine linked to a hub keeps only a legacy one. */
+  readonly excludeInbox?: boolean | undefined;
+};
 export type BacklogChildInput = ContractBacklogChildInput;
 export type BacklogCreateChildrenInput = ContractBacklogCreateChildrenInput;
 export type BacklogClaimInput = ContractBacklogClaimInput;
-export type BacklogClaimNextInput = ContractBacklogClaimNextInput;
+export type BacklogClaimNextInput = ContractBacklogClaimNextInput & {
+  readonly excludeInbox?: boolean | undefined;
+};
 export type BacklogRenewClaimsInput = ContractBacklogRenewClaimsInput;
 
 export interface BacklogAddLinkInput {
@@ -112,6 +117,12 @@ export class BacklogService extends Context.Service<
   BacklogService,
   {
     readonly listBacklogs: () => Effect.Effect<ReadonlyArray<Backlog>, BacklogError>;
+    /**
+     * This machine's Inbox, created on first use. A machine linked to a hub
+     * has none of its own (the hub's is the fleet's), so it is not created at
+     * startup; see BacklogRouter.inboxLayer.
+     */
+    readonly ensureInbox: () => Effect.Effect<Backlog, BacklogError>;
     /** Accepts a backlog id or its key, case-insensitive. */
     readonly resolveBacklogRef: (ref: string) => Effect.Effect<Backlog, BacklogError>;
     /** The project's backlog, created from the project title on first use. */
@@ -566,6 +577,9 @@ export const layer = Layer.effect(
         ? []
         : [sql.in("i.status", filters.status)]),
       ...(filters.type === undefined ? [] : [sql`i.type = ${filters.type}`]),
+      ...(filters.excludeInbox === true
+        ? [sql.literal("i.backlog_id NOT IN (SELECT id FROM backlogs WHERE kind = 'inbox')")]
+        : []),
       ...(filters.parentId === undefined ? [] : [sql`i.parent_id = ${filters.parentId}`]),
       ...(filters.frontierOnly === true
         ? [
@@ -948,29 +962,33 @@ export const layer = Layer.effect(
         yield* sql`DELETE FROM backlogs WHERE id = ${backlogId}`;
       });
 
-    // Inbox: one per environment, created on first start.
     yield* ensureSchema;
-    yield* Effect.gen(function* () {
-      const at = DateTime.formatIso(yield* now);
-      const id = yield* newId;
-      yield* sql`
-        INSERT INTO backlogs (id, kind, key, title, project_id, repository_key, next_number, created_at, updated_at)
-        SELECT ${id}, 'inbox', ${INBOX_KEY}, 'Inbox', NULL, NULL, 1, ${at}, ${at}
-        WHERE NOT EXISTS (SELECT 1 FROM backlogs WHERE kind = 'inbox')
-      `;
-    }).pipe(sql.withTransaction);
-
-    const inbox = Effect.gen(function* () {
-      const rows = yield* selectBacklogs(sql`kind = 'inbox'`);
-      if (rows[0] === undefined)
-        return yield* Effect.die(new Error("The backlog Inbox is missing."));
-      return rows[0];
-    });
 
     // Service methods
 
     const listBacklogs: BacklogService["Service"]["listBacklogs"] = () =>
       selectBacklogs(sql.literal("1=1")).pipe(backlogErrorsOnly);
+
+    const ensureInbox: BacklogService["Service"]["ensureInbox"] = () =>
+      Effect.gen(function* () {
+        const existing = yield* selectBacklogs(sql`kind = 'inbox'`);
+        if (existing[0] !== undefined) return existing[0];
+        const id = yield* newId;
+        return yield* mutate((touched) =>
+          Effect.gen(function* () {
+            const at = DateTime.formatIso(yield* now);
+            const inserted = yield* sql<{ id: string }>`
+              INSERT INTO backlogs (id, kind, key, title, project_id, repository_key, next_number, created_at, updated_at)
+              SELECT ${id}, 'inbox', ${BACKLOG_INBOX_KEY}, 'Inbox', NULL, NULL, 1, ${at}, ${at}
+              WHERE NOT EXISTS (SELECT 1 FROM backlogs WHERE kind = 'inbox')
+              RETURNING id
+            `;
+            if (inserted[0] !== undefined) touched.backlogs.add(inserted[0].id);
+            const rows = yield* selectBacklogs(sql`kind = 'inbox'`);
+            return rows[0]!;
+          }),
+        );
+      }).pipe(backlogErrorsOnly);
 
     const resolveBacklogRef: BacklogService["Service"]["resolveBacklogRef"] = (ref) =>
       Effect.gen(function* () {
@@ -1003,9 +1021,11 @@ export const layer = Layer.effect(
               ]),
             );
             if (raced[0] !== undefined) return raced[0];
-            const taken = new Set(
-              (yield* sql<{ key: string }>`SELECT key FROM backlogs`).map((row) => row.key),
-            );
+            // The Inbox's key stays free even while this machine has no Inbox.
+            const taken = new Set([
+              BACKLOG_INBOX_KEY,
+              ...(yield* sql<{ key: string }>`SELECT key FROM backlogs`).map((row) => row.key),
+            ]);
             let key = base;
             for (let suffix = 2; taken.has(key); suffix++) {
               const digits = String(suffix);
@@ -1072,6 +1092,9 @@ export const layer = Layer.effect(
           const title = input.title ?? backlog.title;
           if (key === backlog.key && title === backlog.title) return backlog;
           if (key !== backlog.key) {
+            if (key === BACKLOG_INBOX_KEY && backlog.kind !== "inbox") {
+              return yield* conflict(`The key ${key} is reserved for the Inbox.`);
+            }
             const clash =
               yield* sql`SELECT 1 FROM backlogs WHERE key = ${key} AND id <> ${backlog.id}`;
             if (clash.length > 0) return yield* conflict(`The key ${key} is already in use.`);
@@ -1160,7 +1183,7 @@ export const layer = Layer.effect(
               ? yield* ensureProjectBacklog(input.projectId)
               : input.repository !== undefined
                 ? yield* ensureRepositoryBacklog(input.repository)
-                : yield* inbox;
+                : yield* ensureInbox();
         yield* assertLive(backlog);
         const id = yield* mutate((touched) =>
           Effect.gen(function* () {
@@ -1496,7 +1519,9 @@ export const layer = Layer.effect(
         Effect.gen(function* () {
           const backlog = yield* loadBacklog(backlogId);
           if (backlog.kind !== "project") {
-            return yield* invalid("Only project boards move; every machine keeps its own Inbox.");
+            return yield* invalid(
+              "Only project boards move. A linked machine's Inbox moves to the hub's issue by issue.",
+            );
           }
           if (backlog.repositoryKey === null) {
             return yield* invalid(
@@ -1772,6 +1797,7 @@ export const layer = Layer.effect(
 
     return BacklogService.of({
       listBacklogs,
+      ensureInbox,
       resolveBacklogRef,
       ensureProjectBacklog,
       ensureRepositoryBacklog,

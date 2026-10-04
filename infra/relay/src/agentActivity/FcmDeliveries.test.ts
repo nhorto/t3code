@@ -868,3 +868,63 @@ describe("FCM queue message isolation", () => {
     },
   );
 });
+
+describe("Android held agent message alerts", () => {
+  const notification = {
+    environmentId: EnvironmentId.make("env"),
+    threadId: ThreadId.make("thread"),
+    title: "Agent message held: Codex → Claude",
+    body: "Can you rerun the tests?",
+    count: 1,
+    messageId: "message-1",
+    deepLink: "/backlog/messages" as const,
+  };
+
+  it.effect("posts an alert-only message that opens Messages and leaves the card alone", () => {
+    const h = harness();
+    h.current.target.last_aggregate_json = encodeJson(aggregateFor([state]));
+    return Effect.gen(function* () {
+      const delivery = yield* FcmDeliveries.FcmDeliveries;
+      yield* delivery.enqueueHeldAgentMessage({ target: h.current.target, notification });
+      expect(h.queued).toEqual([
+        { ...h.job, state: null, heldAgentMessage: notification, queuedAt: 0 },
+      ]);
+      yield* delivery.process(h.queued[0]);
+      yield* delivery.process(h.queued[0]);
+      expect(h.sent).toHaveLength(2);
+      expect(h.sent[0]?.alert).toBe(true);
+      expect(h.sent[0]?.data).toMatchObject({
+        t3_kind: "agent_alert",
+        alert_title: "Agent message held: Codex → Claude",
+        alert_body: "Can you rerun the tests?",
+        alert_path: "/backlog/messages",
+      });
+      expect(h.sent[0]?.data).not.toHaveProperty("active");
+      // A queue retry carries the same id, so the device posts it once.
+      expect(h.sent[1]?.data.alert_id).toBe(h.sent[0]?.data.alert_id);
+      expect(h.marked).toHaveLength(0);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect.each(["device", "environment", "unlinked"] as const)(
+    "drops the alert when notifications are off (%s)",
+    (off) => {
+      const h = harness();
+      if (off === "device") {
+        h.current.target.preferences_json = encodeJson({
+          ...preferences,
+          notificationsEnabled: false,
+        });
+      } else if (off === "environment") {
+        h.current.mutedEnvironments.push("env");
+      } else {
+        h.current.linked = false;
+      }
+      return Effect.gen(function* () {
+        const delivery = yield* FcmDeliveries.FcmDeliveries;
+        yield* delivery.process({ ...h.job, state: null, heldAgentMessage: notification });
+        expect(h.sent).toHaveLength(0);
+      }).pipe(Effect.provide(h.layer));
+    },
+  );
+});

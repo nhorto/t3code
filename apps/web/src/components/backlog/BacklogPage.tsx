@@ -362,6 +362,18 @@ export function BacklogPage({
                 ))}
               </div>
             ) : null}
+            {entry.legacyInbox ? (
+              <LegacyInboxNotice
+                environmentId={entry.legacyInbox.environmentId}
+                hubLabel={entry.legacyInbox.hubLabel}
+                machineLabel={
+                  sourceById.get(entry.legacyInbox.environmentId)?.label ?? "This machine"
+                }
+                openCount={entry.openCount}
+                writable={singleBacklog !== null && isBacklogRefWritable(singleBacklog, sourceById)}
+                onEmptied={() => updateSearch({ scope: "inbox" })}
+              />
+            ) : null}
             {movedAway.map(({ ref, movedTo }) => (
               <p
                 key={`${ref.environmentId}:${ref.backlog.id}`}
@@ -466,12 +478,13 @@ function BacklogSwitcher({
   onSelect: (entry: BacklogSwitcherEntry) => void;
 }) {
   const fixed = entries.filter((entry) => entry.key === "all" || entry.key === "inbox");
-  const withBacklog = entries.filter(
-    (entry) => entry.key !== "all" && entry.key !== "inbox" && entry.backlogs.length > 0,
+  // Legacy Inboxes sit under the Inbox until they are empty.
+  const legacy = entries.filter((entry) => entry.legacyInbox !== null);
+  const projects = entries.filter(
+    (entry) => entry.key !== "all" && entry.key !== "inbox" && entry.legacyInbox === null,
   );
-  const withoutBacklog = entries.filter(
-    (entry) => entry.key !== "all" && entry.key !== "inbox" && entry.backlogs.length === 0,
-  );
+  const withBacklog = projects.filter((entry) => entry.backlogs.length > 0);
+  const withoutBacklog = projects.filter((entry) => entry.backlogs.length === 0);
   const item = (entry: BacklogSwitcherEntry) => (
     <MenuRadioItem key={entry.key} value={entry.key}>
       <span className="flex min-w-0 items-center gap-2">
@@ -501,6 +514,7 @@ function BacklogSwitcher({
           }}
         >
           {fixed.map(item)}
+          {legacy.map(item)}
           {withBacklog.length > 0 ? (
             <>
               <MenuSeparator />
@@ -607,6 +621,84 @@ function BacklogFilterMenu({
         </MenuCheckboxItem>
       </MenuPopup>
     </Menu>
+  );
+}
+
+/**
+ * An Inbox a machine kept from before it was linked to a hub. Moving re-creates each open issue on
+ * the hub's Inbox and closes it here with a note saying where it went.
+ */
+function LegacyInboxNotice({
+  environmentId,
+  hubLabel,
+  machineLabel,
+  openCount,
+  writable,
+  onEmptied,
+}: {
+  environmentId: EnvironmentId;
+  hubLabel: string;
+  machineLabel: string;
+  openCount: number;
+  writable: boolean;
+  onEmptied: () => void;
+}) {
+  const [pending, setPending] = useState(false);
+  const moveInbox = useAtomCommand(backlogEnvironment.moveInboxToHub, {
+    label: "backlog move inbox to hub",
+    reportFailure: false,
+  });
+  const move = async () => {
+    const issues = openCount === 1 ? "its open issue" : `its ${openCount} open issues`;
+    if (
+      !(await confirmAction(
+        `Move ${issues} to the ${hubLabel} Inbox? Each is closed here as won't fix with a note saying where it went.`,
+      ))
+    ) {
+      return;
+    }
+    setPending(true);
+    const result = await moveInbox({ environmentId, input: {} });
+    setPending(false);
+    if (result._tag === "Success") {
+      const { moved, skipped } = result.value;
+      toastManager.add({
+        type: skipped.length > 0 ? "warning" : "success",
+        title: `Moved ${moved.length} ${moved.length === 1 ? "issue" : "issues"} to the ${hubLabel} Inbox`,
+        ...(skipped.length > 0
+          ? {
+              description: `${skipped.join(", ")} stayed: an agent holds ${skipped.length === 1 ? "it" : "them"}. Move again once released.`,
+            }
+          : {}),
+      });
+      if (skipped.length === 0) onEmptied();
+      return;
+    }
+    if (!isAtomCommandInterrupted(result)) {
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: `Could not move to the ${hubLabel} Inbox`,
+          description: backlogFailureMessage(result),
+        }),
+      );
+    }
+  };
+  return (
+    <div className="flex flex-wrap items-center gap-2 px-5 sm:px-6">
+      <p className="text-xs text-muted-foreground">
+        {machineLabel} is linked to {hubLabel}, whose Inbox is the one for every machine. This is
+        its old Inbox.
+      </p>
+      <Button
+        size="xs"
+        variant="outline"
+        disabled={!writable || pending}
+        onClick={() => void move()}
+      >
+        Move to {hubLabel} Inbox
+      </Button>
+    </div>
   );
 }
 

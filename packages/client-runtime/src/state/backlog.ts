@@ -8,6 +8,7 @@ import {
   type BacklogIssue,
   type BacklogIssueId,
   type BacklogIssueStatus,
+  type BacklogLinkedHub,
   type BacklogStreamEvent,
   type EnvironmentId,
 } from "@t3tools/contracts";
@@ -43,6 +44,8 @@ export interface BacklogBoardState {
   readonly asOf?: string;
   /** Loaded from this client's cache and not yet confirmed by the environment: read-only. */
   readonly fromCache?: true;
+  /** The hub the environment is linked to. Its Inbox is then the fleet's, and one here is legacy. */
+  readonly linkedHub?: BacklogLinkedHub | null;
 }
 
 export const EMPTY_BACKLOG_BOARD: BacklogBoardState = {
@@ -65,7 +68,7 @@ export function foldBacklogStreamEvent(
 ): BacklogBoardState {
   switch (event.type) {
     case "snapshot":
-      return fromIssues(event.backlogs, event.issues);
+      return { ...fromIssues(event.backlogs, event.issues), linkedHub: event.linkedHub ?? null };
     case "backlogUpserted": {
       const index = state.backlogs.findIndex((backlog) => backlog.id === event.backlog.id);
       const backlogs =
@@ -118,11 +121,69 @@ export function backlogBoardForCache(
     asOf: board.asOf ?? isoAt(nowMs),
     backlogs: board.backlogs,
     issues,
+    linkedHub: board.linkedHub ?? null,
   };
 }
 
 export function backlogBoardFromCache(stored: Persistence.StoredBacklogBoard): BacklogBoardState {
-  return { ...fromIssues(stored.backlogs, stored.issues), asOf: stored.asOf, fromCache: true };
+  return {
+    ...fromIssues(stored.backlogs, stored.issues),
+    asOf: stored.asOf,
+    fromCache: true,
+    linkedHub: stored.linkedHub ?? null,
+  };
+}
+
+/**
+ * With a hub there is one Inbox for every machine, the hub's. The fleet these boards describe: the
+ * hub an environment is linked to (preferring one this client also sees) and the environments
+ * linked to it. Null when no environment is linked.
+ */
+export interface BacklogFleet {
+  readonly hub: BacklogLinkedHub;
+  readonly spokeEnvironmentIds: ReadonlySet<EnvironmentId>;
+}
+
+export function backlogFleet(
+  boards: ReadonlyArray<{
+    readonly environmentId: EnvironmentId;
+    readonly board: Pick<BacklogBoardState, "linkedHub"> | null;
+  }>,
+): BacklogFleet | null {
+  const hubs = boards.flatMap(({ board }) => (board?.linkedHub ? [board.linkedHub] : []));
+  const seen = new Set(boards.map((entry) => entry.environmentId));
+  const hub = hubs.find((candidate) => seen.has(candidate.environmentId)) ?? hubs[0];
+  if (hub === undefined) return null;
+  return {
+    hub,
+    spokeEnvironmentIds: new Set(
+      boards.flatMap(({ environmentId, board }) =>
+        board?.linkedHub?.environmentId === hub.environmentId ? [environmentId] : [],
+      ),
+    ),
+  };
+}
+
+/**
+ * The Inbox an environment kept from before it was linked to a hub, with its open issues; null when
+ * the environment is not linked or has no Inbox. Clients list it under the hub's while it is not
+ * empty, with the action that moves its issues to the hub.
+ */
+export function legacyBacklogInbox(
+  board: Pick<BacklogBoardState, "backlogs" | "issues" | "linkedHub">,
+): {
+  readonly backlog: Backlog;
+  readonly hub: BacklogLinkedHub;
+  readonly openCount: number;
+} | null {
+  const hub = board.linkedHub;
+  const backlog = board.backlogs.find((candidate) => candidate.kind === "inbox");
+  if (!hub || backlog === undefined) return null;
+  let openCount = 0;
+  for (const issue of board.issues) {
+    if (issue.backlogId === backlog.id && !isBacklogStatusClosed(issue.status)) openCount += 1;
+  }
+  return { backlog, hub, openCount };
 }
 
 /**
@@ -360,6 +421,13 @@ export function createBacklogEnvironmentAtoms<R, E>(
       label: "environment-data:backlog:move-backlog",
       execute: moveBacklogHome,
       scheduler,
+    }),
+    /** On an environment linked to a hub, moves its legacy Inbox's open issues to the hub's. */
+    moveInboxToHub: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:backlog:move-inbox-to-hub",
+      tag: WS_METHODS.backlogMoveInboxToHub,
+      scheduler,
+      concurrency: serialPerEnvironment,
     }),
     /** Makes a moved backlog live on this environment again, e.g. after a move that never landed. */
     restoreBacklog: createEnvironmentRpcCommand(runtime, {

@@ -542,3 +542,68 @@ describe("offline and moved boards", () => {
     });
   });
 });
+
+describe("one Inbox for the fleet", () => {
+  const hub = { environmentId: GEEKOM, label: "Geekom" };
+  const laptopInbox = backlog("inbox-l", "inbox", "Inbox");
+  const boards = (laptopIssues: BacklogIssue[]): EnvironmentBacklogBoard[] => [
+    { environmentId: GEEKOM, board: board([backlog("inbox-g", "inbox", "Inbox")], []) },
+    {
+      environmentId: LAPTOP,
+      board: { ...board([laptopInbox], laptopIssues), linkedHub: hub },
+    },
+  ];
+  const scopesFor = (laptopIssues: BacklogIssue[]) =>
+    buildBacklogScopes({
+      boards: boards(laptopIssues),
+      projectGroups: [],
+      environmentLabel: (environmentId) => (environmentId === LAPTOP ? "Laptop" : "Geekom"),
+    });
+
+  it("lists the hub's Inbox once, with a linked machine's old Inbox under it while not empty", () => {
+    const scopes = scopesFor([issue("old", "inbox-l", { status: "inbox" })]);
+    expect(scopes.map((scope) => scope.label)).toEqual([
+      "All backlogs",
+      "Inbox",
+      "Inbox on Laptop (legacy)",
+    ]);
+    expect(resolveBacklogScope(scopes, "inbox").backlogs.map((entry) => entry.backlog.id)).toEqual([
+      "inbox-g",
+    ]);
+    const legacy = scopes[2]!;
+    expect(legacy.legacyInbox).toEqual({ environmentId: LAPTOP, hubLabel: "Geekom" });
+    expect(resolveBacklogCreateTarget(legacy, [env(LAPTOP), env(GEEKOM)])).toMatchObject({
+      target: null,
+      blockedReason: "New ideas go to the Geekom Inbox.",
+    });
+    expect(defaultQuickAddScopeKey(legacy)).toBe("inbox");
+
+    const emptied = scopesFor([issue("old", "inbox-l", { status: "wontfix" })]);
+    expect(emptied.some((scope) => scope.kind === "legacyInbox")).toBe(false);
+  });
+
+  it("sends Inbox ideas to the hub, or through a linked machine while the hub is away", () => {
+    const inbox = resolveBacklogScope(scopesFor([]), "inbox");
+    expect(resolveBacklogCreateTarget(inbox, [env(LAPTOP), env(GEEKOM)]).target).toEqual({
+      environmentId: GEEKOM,
+      input: { backlogId: "inbox-g" },
+    });
+    expect(resolveBacklogCreateTarget(inbox, [env(LAPTOP), env(GEEKOM, "offline")]).target).toEqual(
+      { environmentId: LAPTOP, input: {} },
+    );
+    expect(
+      resolveBacklogCreateTarget(inbox, [env(LAPTOP, "offline"), env(GEEKOM, "offline")]),
+    ).toEqual({
+      target: null,
+      blockedReason: "The Inbox lives on Geekom, which is not connected.",
+      loading: false,
+    });
+  });
+
+  it("offers no move into a legacy Inbox", () => {
+    const linkedBoard = boards([])[1]!.board;
+    expect(
+      backlogMoveTargets(linkedBoard, { backlogId: BacklogId.make("other") }, [], new Set()),
+    ).toEqual([]);
+  });
+});

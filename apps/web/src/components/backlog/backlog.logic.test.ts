@@ -754,3 +754,78 @@ describe("moving a board's home", () => {
     expect(isBacklogRefWritable(onlyRedirect.backlogs[0]!, new Map([[mac, both[0]!]]))).toBe(false);
   });
 });
+
+describe("one Inbox for the fleet", () => {
+  const linked = { environmentId: geekom, label: "Geekom" };
+  const macInbox = backlog({ id: BacklogId.make("backlog-inbox-mac") });
+  const geekomInbox = backlog({ id: BacklogId.make("backlog-inbox-geekom") });
+  const oldIdea = issue({ id: "old", backlogId: macInbox.id, key: "INBOX-1", status: "inbox" });
+  const switcher = (sources: ReadonlyArray<BacklogSource>) =>
+    buildBacklogSwitcher({ sources, projects: [], groupingSettings, primaryEnvironmentId: mac });
+  const linkedMac = (issues: BacklogIssue[], status: BacklogSource["status"] = "live") =>
+    source({
+      environmentId: mac,
+      status,
+      board: { ...board([macInbox], issues), linkedHub: linked },
+    });
+
+  it("shows the hub's Inbox once, with a linked machine's old Inbox under it while not empty", () => {
+    const entries = switcher([
+      linkedMac([oldIdea]),
+      source({ environmentId: geekom, board: board([geekomInbox], []) }),
+    ]);
+    const inbox = entries.find((entry) => entry.key === "inbox");
+    expect(inbox?.backlogs.map((ref) => ref.backlog.id)).toEqual([geekomInbox.id]);
+    // The primary machine is linked, so the idea goes to the hub's Inbox.
+    expect(inbox?.createTarget).toEqual({ environmentId: geekom, backlogId: geekomInbox.id });
+
+    const legacy = entries.filter((entry) => entry.legacyInbox !== null);
+    expect(legacy.map((entry) => [entry.label, entry.openCount, entry.createTarget])).toEqual([
+      ["Inbox on MacBook (legacy)", 1, null],
+    ]);
+    expect(legacy[0]?.legacyInbox).toEqual({ environmentId: mac, hubLabel: "Geekom" });
+    expect(entries.indexOf(legacy[0]!)).toBe(entries.indexOf(inbox!) + 1);
+
+    const emptied = switcher([
+      linkedMac([{ ...oldIdea, status: "wontfix" }]),
+      source({ environmentId: geekom, board: board([geekomInbox], []) }),
+    ]);
+    expect(emptied.some((entry) => entry.legacyInbox !== null)).toBe(false);
+  });
+
+  it("sends Inbox ideas through a linked machine when the hub itself is not connected", () => {
+    const viaSpoke = switcher([
+      linkedMac([]),
+      source({ environmentId: geekom, status: "unavailable", board: null }),
+    ]);
+    expect(viaSpoke.find((entry) => entry.key === "inbox")?.createTarget).toEqual({
+      environmentId: mac,
+    });
+
+    const nowhere = switcher([linkedMac([], "stale")]);
+    const inbox = nowhere.find((entry) => entry.key === "inbox");
+    expect(inbox?.createTarget).toBeNull();
+    expect(inbox?.createBlockedReason).toBe("The Inbox lives on Geekom, which is not connected.");
+  });
+
+  it("keeps the primary machine's Inbox when no machine is linked", () => {
+    const entries = switcher([
+      source({ environmentId: mac, board: board([macInbox], []) }),
+      source({ environmentId: geekom, board: board([geekomInbox], []) }),
+    ]);
+    const inbox = entries.find((entry) => entry.key === "inbox");
+    expect(inbox?.backlogs).toHaveLength(2);
+    expect(inbox?.createTarget).toEqual({ environmentId: mac, backlogId: macInbox.id });
+  });
+
+  it("offers no move into a legacy Inbox", () => {
+    const targets = backlogMoveTargets({
+      currentBacklogId: wineBacklog.id,
+      backlogs: [macInbox, wineBacklog],
+      inboxIsLegacy: true,
+      projects: [],
+      creatableProjectIds: new Set(),
+    });
+    expect(targets).toEqual([]);
+  });
+});

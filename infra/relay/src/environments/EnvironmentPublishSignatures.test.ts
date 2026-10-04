@@ -4,8 +4,14 @@ import type {
   RelayAgentActivityPublishProofPayload,
   RelayAgentActivityPublishRequest,
   RelayAgentActivityState,
+  RelayHeldAgentMessageNotification,
+  RelayHeldAgentMessagePublishProofPayload,
+  RelayHeldAgentMessagePublishRequest,
 } from "@t3tools/contracts/relay";
-import { RELAY_ACTIVITY_PUBLISH_TYP } from "@t3tools/shared/relayJwt";
+import {
+  RELAY_ACTIVITY_PUBLISH_TYP,
+  RELAY_HELD_MESSAGE_PUBLISH_TYP,
+} from "@t3tools/shared/relayJwt";
 import { stableStringify } from "@t3tools/shared/relaySigning";
 import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
@@ -56,10 +62,12 @@ const isEnvironmentPublishSignatureInvalid = Schema.is(
   EnvironmentPublishSignatures.EnvironmentPublishSignatureInvalid,
 );
 
-function signTestJwt(payload: object, privateKey: string): string {
-  const header = Buffer.from(
-    JSON.stringify({ alg: "EdDSA", typ: RELAY_ACTIVITY_PUBLISH_TYP }),
-  ).toString("base64url");
+function signTestJwt(
+  payload: object,
+  privateKey: string,
+  typ: string = RELAY_ACTIVITY_PUBLISH_TYP,
+): string {
+  const header = Buffer.from(JSON.stringify({ alg: "EdDSA", typ })).toString("base64url");
   const encodedPayload = Buffer.from(JSON.stringify(payload)).toString("base64url");
   const signingInput = `${header}.${encodedPayload}`;
   return `${signingInput}.${NodeCrypto.sign(null, Buffer.from(signingInput), privateKey).toString("base64url")}`;
@@ -83,6 +91,36 @@ const freshRequest = Effect.gen(function* () {
     proof: signTestJwt(payload, keyPair.privateKey),
   } satisfies RelayAgentActivityPublishRequest;
 });
+
+const notification: RelayHeldAgentMessageNotification = {
+  environmentId: state.environmentId,
+  threadId: state.threadId,
+  title: "Agent message held: Codex → Claude",
+  body: "Can you rerun the tests?",
+  count: 1,
+  messageId: "message-1",
+  deepLink: "/backlog/messages",
+};
+
+const freshHeldMessageRequest = (typ: string = RELAY_HELD_MESSAGE_PUBLISH_TYP) =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const payload = {
+      iss: "t3-env:env",
+      aud: "https://relay.example.test",
+      sub: "env",
+      jti: "held-jti",
+      iat: Math.floor(now.epochMilliseconds / 1_000),
+      exp: Math.floor(DateTime.add(now, { minutes: 5 }).epochMilliseconds / 1_000),
+      environmentId: state.environmentId,
+      threadId: state.threadId,
+      notification,
+    } satisfies RelayHeldAgentMessagePublishProofPayload;
+    return {
+      notification,
+      proof: signTestJwt(payload, keyPair.privateKey, typ),
+    } satisfies RelayHeldAgentMessagePublishRequest;
+  });
 
 function layer(replay?: Partial<DpopProofs.DpopProofReplay["Service"]>) {
   return EnvironmentPublishSignatures.layer.pipe(
@@ -220,5 +258,31 @@ describe("EnvironmentPublishSignatures", () => {
         }
       }
     }).pipe(Effect.provide(layer({ consume: () => Effect.succeed(false) }))),
+  );
+
+  it.effect("verifies held message JWTs and rejects tampering or the activity JWT type", () =>
+    Effect.gen(function* () {
+      const signatures = yield* EnvironmentPublishSignatures.EnvironmentPublishSignatures;
+      const verify = (request: RelayHeldAgentMessagePublishRequest) =>
+        signatures.verifyHeldAgentMessage({
+          environmentId: state.environmentId,
+          environmentPublicKey: keyPair.publicKey,
+          threadId: state.threadId,
+          request,
+        });
+      yield* verify(yield* freshHeldMessageRequest());
+
+      const request = yield* freshHeldMessageRequest();
+      const tampered = yield* Effect.flip(
+        verify({ ...request, notification: { ...notification, body: "Tampered" } }),
+      );
+      expect(tampered).toMatchObject({ stage: "validate_claims" });
+
+      // An activity proof cannot be replayed as a held message alert.
+      const wrongType = yield* Effect.flip(
+        verify(yield* freshHeldMessageRequest(RELAY_ACTIVITY_PUBLISH_TYP)),
+      );
+      expect(wrongType).toMatchObject({ stage: "verify_proof" });
+    }).pipe(Effect.provide(layer())),
   );
 });

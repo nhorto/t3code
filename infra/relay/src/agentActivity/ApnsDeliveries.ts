@@ -3,6 +3,7 @@ import type {
   RelayAgentAwarenessPreferences,
   RelayDeliveryKind,
   RelayDeliveryResult,
+  RelayHeldAgentMessageNotification,
 } from "@t3tools/contracts/relay";
 import {
   RelayAgentActivityAggregateState as RelayAgentActivityAggregateStateSchema,
@@ -528,6 +529,11 @@ export class ApnsDeliveries extends Context.Service<
     readonly sendPushNotificationForTarget: (input: {
       readonly target: LiveActivities.TargetRow;
       readonly aggregate: RelayAgentActivityAggregateState | null;
+    }) => Effect.Effect<RelayDeliveryResult | null, ApnsDeliveryError>;
+    /** Queues a held agent message alert; null when the device does not take alerts. */
+    readonly sendHeldAgentMessageForTarget: (input: {
+      readonly target: LiveActivities.TargetRow;
+      readonly notification: RelayHeldAgentMessageNotification;
     }) => Effect.Effect<RelayDeliveryResult | null, ApnsDeliveryError>;
     readonly sendLiveActivity: (
       input: SendLiveActivityDeliveryInput,
@@ -1119,6 +1125,26 @@ export const make = Effect.gen(function* () {
             notification,
           })
         : Effect.succeed(null);
+    }),
+    sendHeldAgentMessageForTarget: Effect.fnUntraced(function* (input) {
+      const token = input.target.push_token;
+      if (!config.apns || !token) return null;
+      if (!parsePreferences(input.target.preferences_json)?.notificationsEnabled) return null;
+      // No phase or updatedAt: the queued job only rechecks that alerts are still on.
+      return yield* deliveryQueue.enqueuePushNotification({
+        userId: input.target.user_id,
+        deviceId: input.target.device_id,
+        token,
+        bundleId: input.target.bundle_id,
+        apsEnvironment: input.target.aps_environment,
+        notification: {
+          title: input.notification.title,
+          body: input.notification.body,
+          environmentId: input.notification.environmentId,
+          threadId: input.notification.threadId,
+          deepLink: input.notification.deepLink,
+        },
+      });
     }),
     sendForTarget: Effect.fnUntraced(function* (input) {
       if (!config.apns) return null;

@@ -14,7 +14,10 @@ import {
   ThreadId,
   TurnItemId,
 } from "@t3tools/contracts";
-import { RelayAgentActivityState } from "@t3tools/contracts/relay";
+import {
+  RelayAgentActivityState,
+  RelayHeldAgentMessageNotification,
+} from "@t3tools/contracts/relay";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -90,7 +93,10 @@ function shell(overrides: Partial<OrchestrationV2ThreadShell> = {}): Orchestrati
   };
 }
 
-const PublishPayload = Schema.Struct({ state: Schema.NullOr(RelayAgentActivityState) });
+const PublishPayload = Schema.Struct({
+  state: Schema.optional(Schema.NullOr(RelayAgentActivityState)),
+  notification: Schema.optional(RelayHeldAgentMessageNotification),
+});
 const decodePublishPayload = Schema.decodeUnknownSync(Schema.fromJsonString(PublishPayload));
 const unused = () => Effect.die("Unexpected test dependency call");
 
@@ -216,6 +222,7 @@ const makeTestRelay = Effect.fnUntraced(function* (
     readonly url: string;
     readonly authorization: string | null;
     readonly state: RelayAgentActivityState | null;
+    readonly notification?: RelayHeldAgentMessageNotification;
   }> = [];
   const fetch: typeof globalThis.fetch = Object.assign(
     (
@@ -232,7 +239,8 @@ const makeTestRelay = Effect.fnUntraced(function* (
       publications.push({
         url: String(input),
         authorization: new Headers(init?.headers).get("authorization"),
-        state: payload.state,
+        state: payload.state ?? null,
+        ...(payload.notification ? { notification: payload.notification } : {}),
       });
       return Promise.resolve(
         options.respond?.(publications.length) ?? Response.json({ ok: true, deliveries: [] }),
@@ -378,6 +386,34 @@ describe("AgentAwarenessRelay", () => {
       yield* relay.publishThread(THREAD_ID);
       assert.equal(publications.length, 2);
       assert.equal(publications[1]?.state?.threadTitle, "Renamed thread");
+    }),
+  );
+
+  it.effect("publishes held agent message alerts to their own endpoint while enabled", () =>
+    Effect.gen(function* () {
+      const { relay, secrets, publications } = yield* makeTestRelay();
+      const alert = {
+        threadId: THREAD_ID,
+        title: "Agent message held: Codex → Claude",
+        body: "Can you rerun the tests?",
+        count: 1,
+        messageId: "message-1",
+      };
+      yield* relay.publishHeldAgentMessage(alert);
+      assert.equal(publications.length, 1);
+      assert.equal(
+        publications[0]?.url,
+        `https://relay.example.test/v1/environments/relay-environment/threads/${THREAD_ID}/held-agent-messages`,
+      );
+      assert.deepEqual(publications[0]?.notification, {
+        ...alert,
+        environmentId: EnvironmentId.make("relay-environment"),
+        deepLink: "/backlog/messages",
+      });
+
+      yield* secrets.set(PUBLISH_AGENT_ACTIVITY_SECRET, new TextEncoder().encode("false"));
+      yield* relay.publishHeldAgentMessage(alert);
+      assert.equal(publications.length, 1);
     }),
   );
 

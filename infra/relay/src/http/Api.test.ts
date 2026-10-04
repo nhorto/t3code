@@ -1184,6 +1184,7 @@ describe("relay routing fallback", () => {
             published.push(input);
             return { ok: true as const, deliveries: [] };
           }),
+        publishHeldAgentMessage: () => Effect.succeed({ ok: true as const, deliveries: [] }),
         replayForLiveActivityRegistration: () => Effect.succeed(null),
       });
       const signatures = Layer.succeed(EnvironmentPublishSignatures.EnvironmentPublishSignatures, {
@@ -1191,6 +1192,7 @@ describe("relay routing fallback", () => {
           Effect.sync(() => {
             verified.push(input);
           }),
+        verifyHeldAgentMessage: () => Effect.void,
       });
       const auth = Layer.succeed(RelayEnvironmentAuth, {
         environmentBearer: (effect) =>

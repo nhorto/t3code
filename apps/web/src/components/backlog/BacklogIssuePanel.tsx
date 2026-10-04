@@ -290,6 +290,7 @@ function IssueDetailBody({
   const moveTargets = backlogMoveTargets({
     currentBacklogId: issue.backlogId,
     backlogs: board?.backlogs ?? [],
+    inboxIsLegacy: (board?.linkedHub ?? null) !== null,
     projects: projects.filter((project) => project.environmentId === environmentId),
     creatableProjectIds,
   });

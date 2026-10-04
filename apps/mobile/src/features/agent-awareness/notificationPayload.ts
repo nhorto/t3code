@@ -1,3 +1,5 @@
+import { RELAY_HELD_AGENT_MESSAGES_DEEP_LINK } from "@t3tools/contracts/relay";
+
 function dataFromNotificationResponse(response: unknown): Record<string, unknown> | null {
   if (typeof response !== "object" || response === null) {
     return null;
@@ -82,9 +84,25 @@ export function threadDeepLinkOnScreen(pathname: string): string | null {
   return `/threads/${match[1]}/${match[2]}`;
 }
 
+/**
+ * The deep link a notification would carry to target what the route shows: a
+ * thread (including its nested screens) or the agent Messages screen. Null
+ * elsewhere.
+ */
+export function notificationDeepLinkOnScreen(pathname: string): string | null {
+  return pathname === RELAY_HELD_AGENT_MESSAGES_DEEP_LINK
+    ? RELAY_HELD_AGENT_MESSAGES_DEEP_LINK
+    : threadDeepLinkOnScreen(pathname);
+}
+
 export function extractAgentNotificationDeepLink(response: unknown): string | null {
   const data = dataFromNotificationResponse(response);
   const deepLink = data?.deepLink;
+  // Held agent message alerts open the Messages screen. Only this exact path is
+  // accepted, and it wins over the receiving thread ids the payload also carries.
+  if (deepLink === RELAY_HELD_AGENT_MESSAGES_DEEP_LINK) {
+    return RELAY_HELD_AGENT_MESSAGES_DEEP_LINK;
+  }
   if (typeof deepLink === "string") {
     const normalizedDeepLink = normalizeThreadDeepLink(deepLink);
     if (normalizedDeepLink) {

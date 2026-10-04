@@ -1,6 +1,9 @@
 import {
+  backlogFleet,
   groupBacklogIssuesByStatus,
+  legacyBacklogInbox,
   type BacklogBoardState,
+  type BacklogFleet,
 } from "@t3tools/client-runtime/state/backlog";
 import {
   BACKLOG_ISSUE_STATUSES,
@@ -103,13 +106,20 @@ export interface ScopedBacklog {
   readonly backlog: Backlog;
 }
 
-/** An entry in the backlog picker: everything, the Inbox, or one logical project. */
+/**
+ * An entry in the backlog picker: everything, the Inbox, one logical project, or an Inbox a
+ * machine kept from before it was linked to a hub (listed while it holds open issues).
+ */
 export interface BacklogScope {
   readonly key: string;
-  readonly kind: "all" | "inbox" | "project";
+  readonly kind: "all" | "inbox" | "project" | "legacyInbox";
   readonly label: string;
   readonly backlogs: ReadonlyArray<ScopedBacklog>;
   readonly projectRefs: ReadonlyArray<BacklogProjectRef>;
+  /** On All and the Inbox: the hub whose Inbox is the one for every machine, when linked. */
+  readonly fleet?: BacklogFleet | null;
+  /** On a legacy Inbox: the hub its open issues move to. */
+  readonly legacyInbox?: { readonly environmentId: EnvironmentId; readonly hubLabel: string };
 }
 
 export interface BoardIssueEntry {
@@ -136,13 +146,36 @@ function compareLabels(left: { readonly label: string }, right: { readonly label
 export function buildBacklogScopes(input: {
   readonly boards: ReadonlyArray<EnvironmentBacklogBoard>;
   readonly projectGroups: ReadonlyArray<BacklogProjectGroup>;
+  readonly environmentLabel?: (environmentId: EnvironmentId) => string | null;
 }): ReadonlyArray<BacklogScope> {
   const allBacklogs = withoutSupersededRedirects(
     input.boards.flatMap(({ environmentId, board }) =>
       board.backlogs.map((backlog) => ({ environmentId, backlog })),
     ),
   );
-  const inboxBacklogs = allBacklogs.filter((entry) => entry.backlog.kind === "inbox");
+  // With a hub there is one Inbox for every machine; a linked machine's own is legacy.
+  const fleet = backlogFleet(input.boards);
+  const linkedIds = new Set(
+    input.boards.flatMap(({ environmentId, board }) => (board.linkedHub ? [environmentId] : [])),
+  );
+  const inboxBacklogs = allBacklogs.filter(
+    (entry) => entry.backlog.kind === "inbox" && !linkedIds.has(entry.environmentId),
+  );
+  const legacyScopes = input.boards.flatMap(({ environmentId, board }): BacklogScope[] => {
+    const legacy = legacyBacklogInbox(board);
+    if (legacy === null || legacy.openCount === 0) return [];
+    const machine = input.environmentLabel?.(environmentId) ?? "another machine";
+    return [
+      {
+        key: `backlog:${environmentId}:${legacy.backlog.id}`,
+        kind: "legacyInbox",
+        label: `Inbox on ${machine} (legacy)`,
+        backlogs: [{ environmentId, backlog: legacy.backlog }],
+        projectRefs: [],
+        legacyInbox: { environmentId, hubLabel: legacy.hub.label },
+      },
+    ];
+  });
   const groupKeyByProjectRef = new Map<string, string>();
   const groupKeyByRepository = new Map<string, string>();
   for (const group of input.projectGroups) {
@@ -195,6 +228,7 @@ export function buildBacklogScopes(input: {
       label: "All backlogs",
       backlogs: allBacklogs,
       projectRefs: [],
+      fleet,
     },
     {
       key: INBOX_BACKLOG_SCOPE_KEY,
@@ -202,7 +236,9 @@ export function buildBacklogScopes(input: {
       label: "Inbox",
       backlogs: inboxBacklogs,
       projectRefs: [],
+      fleet,
     },
+    ...legacyScopes,
     ...[...projectScopes, ...orphanScopes].sort(compareLabels),
   ];
 }
@@ -386,9 +422,51 @@ function joinLabels(environments: ReadonlyArray<BacklogEnvironmentAvailability>)
 }
 
 /**
+ * Where an Inbox idea goes when a connected machine is linked to a hub: the hub's
+ * Inbox, reached directly or through a linked machine, which forwards it.
+ */
+function resolveFleetInboxTarget(
+  fleet: BacklogFleet,
+  inboxes: ReadonlyArray<ScopedBacklog>,
+  environments: ReadonlyArray<BacklogEnvironmentAvailability>,
+): BacklogCreateResolution {
+  const { hub, spokeEnvironmentIds } = fleet;
+  const state = (environmentId: EnvironmentId) =>
+    environments.find((environment) => environment.environmentId === environmentId)?.state;
+  if (state(hub.environmentId) === "ready") {
+    const hubInbox = inboxes.find(
+      (entry) => entry.environmentId === hub.environmentId && entry.backlog.kind === "inbox",
+    );
+    return {
+      target: {
+        environmentId: hub.environmentId,
+        input: hubInbox ? { backlogId: hubInbox.backlog.id } : {},
+      },
+      blockedReason: null,
+      loading: false,
+    };
+  }
+  const spoke = environments.find(
+    (environment) =>
+      environment.state === "ready" && spokeEnvironmentIds.has(environment.environmentId),
+  );
+  if (spoke) {
+    return {
+      target: { environmentId: spoke.environmentId, input: {} },
+      blockedReason: null,
+      loading: false,
+    };
+  }
+  return state(hub.environmentId) === "loading"
+    ? blocked(`Loading ${hub.label}…`, true)
+    : blocked(`The Inbox lives on ${hub.label}, which is not connected.`);
+}
+
+/**
  * Where a new issue lands, in the order the environments are listed. The Inbox
- * (and "All") goes to an environment that already hosts an Inbox, else the first
- * ready one. A project goes to the environment hosting its backlog. Without one,
+ * (and "All") goes to the hub's Inbox when a machine is linked to one; otherwise
+ * to an environment that already hosts an Inbox, else the first ready one. A
+ * legacy Inbox takes nothing new. A project goes to the environment hosting its backlog. Without one,
  * the server creates it from a project id, which is only safe once every
  * environment with a checkout has sent its board: one still loading, or offline,
  * may hold the backlog already, and creating here would split the project.
@@ -397,6 +475,13 @@ export function resolveBacklogCreateTarget(
   scope: BacklogScope,
   environments: ReadonlyArray<BacklogEnvironmentAvailability>,
 ): BacklogCreateResolution {
+  if (scope.kind === "legacyInbox") {
+    const hub = scope.legacyInbox ? `the ${scope.legacyInbox.hubLabel}` : "the hub's";
+    return blocked(`New ideas go to ${hub} Inbox.`);
+  }
+  if (scope.kind !== "project" && scope.fleet) {
+    return resolveFleetInboxTarget(scope.fleet, scope.backlogs, environments);
+  }
   const ready = environments.filter((environment) => environment.state === "ready");
   const order = (environmentId: EnvironmentId) =>
     ready.findIndex((environment) => environment.environmentId === environmentId);
@@ -521,7 +606,10 @@ export function backlogMoveTargets(
     label: backlog.title,
     patch: { backlogId: backlog.id },
   });
-  const inbox = liveBacklogs.filter((backlog) => backlog.kind === "inbox").map(backlogTarget);
+  // A machine linked to a hub offers no Inbox: its own is legacy.
+  const inbox = board.linkedHub
+    ? []
+    : liveBacklogs.filter((backlog) => backlog.kind === "inbox").map(backlogTarget);
   const projectTargets = projects.flatMap((project): BacklogMoveTarget[] => {
     const backlog = backlogByProjectId.get(project.id);
     if (backlog) return [{ ...backlogTarget(backlog), label: project.title }];

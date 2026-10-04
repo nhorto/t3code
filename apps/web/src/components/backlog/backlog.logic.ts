@@ -14,7 +14,11 @@ import {
   type EnvironmentId,
   type ProjectId,
 } from "@t3tools/contracts";
-import type { BacklogBoardState } from "@t3tools/client-runtime/state/backlog";
+import {
+  backlogFleet,
+  type BacklogBoardState,
+  type BacklogFleet,
+} from "@t3tools/client-runtime/state/backlog";
 import type { EnvironmentConnectionPhase } from "@t3tools/client-runtime/connection";
 import * as Schema from "effect/Schema";
 
@@ -202,6 +206,11 @@ export interface BacklogSwitcherEntry {
     readonly environmentId: EnvironmentId;
     readonly projectId: ProjectId;
   }>;
+  /**
+   * Set for an Inbox a machine kept from before it was linked to a hub. Listed while it holds
+   * open issues, with the action that moves them to the hub's Inbox.
+   */
+  readonly legacyInbox: { readonly environmentId: EnvironmentId; readonly hubLabel: string } | null;
 }
 
 function preferPrimary<T extends { readonly environmentId: EnvironmentId }>(
@@ -308,6 +317,72 @@ function resolveProjectCreate(input: {
 }
 
 /**
+ * Where an Inbox idea goes. With a hub there is one Inbox for every machine: the hub's, reached
+ * directly or through a machine linked to it, which forwards the idea. Without one, the primary
+ * machine's Inbox, else any connected machine's.
+ */
+function resolveInboxCreate(input: {
+  readonly inboxes: ReadonlyArray<BacklogRef>;
+  readonly fleet: BacklogFleet | null;
+  readonly sources: ReadonlyArray<BacklogSource>;
+  readonly sourceById: ReadonlyMap<EnvironmentId, BacklogSource>;
+  readonly primaryEnvironmentId: EnvironmentId | null;
+}): CreateResolution {
+  const { fleet, sources, sourceById, primaryEnvironmentId } = input;
+  const writable = (environmentId: EnvironmentId) => {
+    const source = sourceById.get(environmentId);
+    return source !== undefined && isBacklogSourceWritable(source);
+  };
+  if (fleet !== null) {
+    const { hub } = fleet;
+    if (writable(hub.environmentId)) {
+      const hubInbox = input.inboxes.find((ref) => ref.environmentId === hub.environmentId);
+      return {
+        createTarget: hubInbox
+          ? { environmentId: hub.environmentId, backlogId: hubInbox.backlog.id }
+          : { environmentId: hub.environmentId },
+        createBlockedReason: null,
+      };
+    }
+    const spoke = preferPrimary(
+      sources.filter((source) => fleet.spokeEnvironmentIds.has(source.environmentId)),
+      writable,
+      primaryEnvironmentId,
+    );
+    if (spoke)
+      return { createTarget: { environmentId: spoke.environmentId }, createBlockedReason: null };
+    return {
+      createTarget: null,
+      createBlockedReason:
+        sourceById.get(hub.environmentId)?.status === "loading"
+          ? `Loading ${hub.label}…`
+          : `The Inbox lives on ${hub.label}, which is not connected.`,
+    };
+  }
+  const primaryInbox = preferPrimary(input.inboxes, writable, primaryEnvironmentId);
+  const inboxSource = preferPrimary(
+    sources.filter((source) => source.board !== null),
+    writable,
+    primaryEnvironmentId,
+  );
+  const createTarget: BacklogCreateTarget | null = primaryInbox
+    ? { environmentId: primaryInbox.environmentId, backlogId: primaryInbox.backlog.id }
+    : inboxSource
+      ? { environmentId: inboxSource.environmentId }
+      : null;
+  const loadingSources = sources.filter((source) => source.status === "loading");
+  return {
+    createTarget,
+    createBlockedReason:
+      createTarget !== null
+        ? null
+        : loadingSources.length > 0
+          ? `Loading ${joinLabels(loadingSources.map((source) => source.label))}…`
+          : "No connected machine can take a new issue.",
+  };
+}
+
+/**
  * The switcher across every connected environment: All, one merged Inbox, then one entry per
  * logical project (the same repository on several machines is one project), then any backlog
  * whose project this client cannot see.
@@ -342,13 +417,17 @@ export function sameBacklogSwitcherSources(
         source.label === other.label &&
         source.status === other.status &&
         (source.board === null) === (other.board === null) &&
+        source.board?.linkedHub?.environmentId === other.board?.linkedHub?.environmentId &&
         source.board?.backlogs === other.board?.backlogs
       );
     })
   );
 }
 
-/** Open issues per entry, one pass over every board. Entries whose count holds keep identity. */
+/**
+ * Open issues per entry, one pass over every board. Entries whose count holds keep identity; a
+ * legacy Inbox with nothing open is dropped.
+ */
 export function withBacklogOpenCounts(
   entries: ReadonlyArray<BacklogSwitcherEntry>,
   sources: ReadonlyArray<BacklogSource>,
@@ -361,12 +440,13 @@ export function withBacklogOpenCounts(
       openByBacklog.set(key, (openByBacklog.get(key) ?? 0) + 1);
     }
   }
-  return entries.map((entry) => {
+  return entries.flatMap((entry) => {
     let openCount = 0;
     for (const ref of entry.backlogs) {
       openCount += openByBacklog.get(`${ref.environmentId}:${ref.backlog.id}`) ?? 0;
     }
-    return openCount === entry.openCount ? entry : { ...entry, openCount };
+    if (entry.legacyInbox !== null && openCount === 0) return [];
+    return [openCount === entry.openCount ? entry : { ...entry, openCount }];
   });
 }
 
@@ -377,10 +457,6 @@ export function buildBacklogSwitcherEntries(
   const { sources, primaryEnvironmentId } = input;
   const labelByEnvironment = new Map(sources.map((source) => [source.environmentId, source.label]));
   const sourceById = new Map(sources.map((source) => [source.environmentId, source]));
-  const writable = (environmentId: EnvironmentId) => {
-    const source = sourceById.get(environmentId);
-    return source !== undefined && isBacklogSourceWritable(source);
-  };
 
   const allBacklogs = withoutSupersededRedirects(
     sources.flatMap((source) =>
@@ -390,26 +466,19 @@ export function buildBacklogSwitcherEntries(
       })),
     ),
   );
-  const inboxes = allBacklogs.filter((ref) => ref.backlog.kind === "inbox");
-
-  const primaryInbox = preferPrimary(inboxes, writable, primaryEnvironmentId);
-  const inboxSource = preferPrimary(
-    sources.filter((source) => source.board !== null),
-    writable,
+  // An Inbox on a machine linked to a hub is legacy: the hub's is the one for every machine.
+  const linkedHubOf = (environmentId: EnvironmentId) =>
+    sourceById.get(environmentId)?.board?.linkedHub ?? null;
+  const inboxRefs = allBacklogs.filter((ref) => ref.backlog.kind === "inbox");
+  const inboxes = inboxRefs.filter((ref) => linkedHubOf(ref.environmentId) === null);
+  const legacyInboxes = inboxRefs.filter((ref) => linkedHubOf(ref.environmentId) !== null);
+  const inboxCreate = resolveInboxCreate({
+    inboxes,
+    fleet: backlogFleet(sources),
+    sources,
+    sourceById,
     primaryEnvironmentId,
-  );
-  const inboxTarget: BacklogCreateTarget | null = primaryInbox
-    ? { environmentId: primaryInbox.environmentId, backlogId: primaryInbox.backlog.id }
-    : inboxSource
-      ? { environmentId: inboxSource.environmentId }
-      : null;
-  const loadingSources = sources.filter((source) => source.status === "loading");
-  const inboxBlockedReason =
-    inboxTarget !== null
-      ? null
-      : loadingSources.length > 0
-        ? `Loading ${joinLabels(loadingSources.map((source) => source.label))}…`
-        : "No connected machine can take a new issue.";
+  });
 
   const groups = buildProjectGroups({
     projects: input.projects,
@@ -484,6 +553,7 @@ export function buildBacklogSwitcherEntries(
         primaryEnvironmentId,
       }),
       projectRefs: group.memberProjectRefs,
+      legacyInbox: null,
     };
   });
 
@@ -501,7 +571,28 @@ export function buildBacklogSwitcherEntries(
     openCount: 0,
     ...resolveProjectCreate({ backlogs: [ref], projectRefs: [], sourceById, primaryEnvironmentId }),
     projectRefs: [],
+    legacyInbox: null,
   }));
+
+  const legacyEntries = legacyInboxes.map((ref): BacklogSwitcherEntry => {
+    const hubLabel = linkedHubOf(ref.environmentId)?.label ?? "the hub";
+    return {
+      key: backlogScopeKey({
+        kind: "backlog",
+        environmentId: ref.environmentId,
+        backlogId: ref.backlog.id,
+      }),
+      scope: { kind: "backlog", environmentId: ref.environmentId, backlogId: ref.backlog.id },
+      label: `Inbox on ${labelByEnvironment.get(ref.environmentId) ?? "Unknown machine"} (legacy)`,
+      machineLabel: null,
+      backlogs: [ref],
+      openCount: 0,
+      createTarget: null,
+      createBlockedReason: `New ideas go to the ${hubLabel} Inbox.`,
+      projectRefs: [],
+      legacyInbox: { environmentId: ref.environmentId, hubLabel },
+    };
+  });
 
   // Name the machines only where two entries would otherwise read the same.
   const named = [...projectEntries, ...orphanEntries];
@@ -530,9 +621,9 @@ export function buildBacklogSwitcherEntries(
       machineLabel: null,
       backlogs: allBacklogs,
       openCount: 0,
-      createTarget: inboxTarget,
-      createBlockedReason: inboxBlockedReason,
+      ...inboxCreate,
       projectRefs: [],
+      legacyInbox: null,
     },
     {
       key: "inbox",
@@ -541,10 +632,11 @@ export function buildBacklogSwitcherEntries(
       machineLabel: null,
       backlogs: inboxes,
       openCount: 0,
-      createTarget: inboxTarget,
-      createBlockedReason: inboxBlockedReason,
+      ...inboxCreate,
       projectRefs: [],
+      legacyInbox: null,
     },
+    ...legacyEntries,
     ...disambiguated,
   ];
 }
@@ -897,17 +989,23 @@ export interface BacklogMoveTarget {
 /**
  * Where an issue can move on its own machine: any other backlog there, or a project there that
  * has no backlog yet (the server creates it on the move) when `creatableProjectIds` allows it.
- * Inbox first, then by name.
+ * Inbox first, then by name. A machine linked to a hub offers no Inbox: its own is legacy.
  */
 export function backlogMoveTargets(input: {
   readonly currentBacklogId: BacklogId;
   readonly backlogs: ReadonlyArray<Backlog>;
+  readonly inboxIsLegacy?: boolean;
   readonly projects: ReadonlyArray<Pick<Project, "id" | "title">>;
   readonly creatableProjectIds: ReadonlySet<ProjectId>;
 }): ReadonlyArray<BacklogMoveTarget> {
   const projectsWithBacklog = new Set(input.backlogs.map((backlog) => backlog.projectId));
   const existing = input.backlogs
-    .filter((backlog) => backlog.id !== input.currentBacklogId && backlog.movedTo === undefined)
+    .filter(
+      (backlog) =>
+        backlog.id !== input.currentBacklogId &&
+        backlog.movedTo === undefined &&
+        !(input.inboxIsLegacy === true && backlog.kind === "inbox"),
+    )
     .map((backlog): BacklogMoveTarget => ({
       value: `backlog:${backlog.id}`,
       label: backlog.kind === "inbox" ? "Inbox" : `${backlog.title} (${backlog.key})`,

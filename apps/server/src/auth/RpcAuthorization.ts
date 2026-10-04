@@ -123,6 +123,7 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.backlogExportBacklog]: AuthAccessWriteScope,
   [WS_METHODS.backlogImportBacklog]: AuthAccessWriteScope,
   [WS_METHODS.backlogRestoreBacklog]: AuthAccessWriteScope,
+  [WS_METHODS.backlogMoveInboxToHub]: AuthBacklogWriteScope,
   [WS_METHODS.agentMessagesSubscribe]: AuthOrchestrationReadScope,
   [WS_METHODS.agentMessagesRelease]: AuthOrchestrationOperateScope,
   [WS_METHODS.agentMessagesDismiss]: AuthOrchestrationOperateScope,

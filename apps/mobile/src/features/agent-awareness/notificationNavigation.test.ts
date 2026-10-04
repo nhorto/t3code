@@ -137,6 +137,32 @@ describe("extractAgentNotificationDeepLink", () => {
     ).toBe("/threads/env/thread");
   });
 
+  it("opens the Messages screen for a held agent message alert", () => {
+    expect(
+      extractAgentNotificationDeepLink(
+        responseWithData({
+          deepLink: "/backlog/messages",
+          environmentId: "env",
+          threadId: "receiver",
+        }),
+      ),
+    ).toBe("/backlog/messages");
+  });
+
+  it("accepts only the exact Messages path", () => {
+    for (const deepLink of [
+      "/backlog/messages?id=1",
+      "/backlog/messages#held",
+      "/backlog/messages/",
+      " /backlog/messages",
+      "//backlog/messages",
+      "/backlog/new",
+      "t3code://backlog/messages",
+    ]) {
+      expect(extractAgentNotificationDeepLink(responseWithData({ deepLink }))).toBeNull();
+    }
+  });
+
   it("ignores malformed or external links", () => {
     expect(
       extractAgentNotificationDeepLink(responseWithData({ deepLink: "https://example.com" })),

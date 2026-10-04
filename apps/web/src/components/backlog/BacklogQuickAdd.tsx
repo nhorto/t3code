@@ -235,7 +235,10 @@ function BacklogQuickAddDialog({
   const { entries } = useBacklogSwitcher();
   const routeProjectRef = useRouteProjectRef();
   const projectRef = request.projectRef ?? routeProjectRef;
-  const choices = useMemo(() => entries.filter((entry) => entry.scope.kind !== "all"), [entries]);
+  const choices = useMemo(
+    () => entries.filter((entry) => entry.scope.kind !== "all" && entry.legacyInbox === null),
+    [entries],
+  );
   const defaultEntry = useMemo(
     () => backlogEntryForProject(choices, projectRef),
     [choices, projectRef],

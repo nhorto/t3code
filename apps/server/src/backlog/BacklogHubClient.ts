@@ -52,6 +52,7 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpApiClient from "effect/unstable/httpapi/HttpApiClient";
 import * as RpcClient from "effect/unstable/rpc/RpcClient";
@@ -97,6 +98,8 @@ export class BacklogHubClient extends Context.Service<
   {
     /** The hub this environment is linked to, if any. */
     readonly linkedHub: Effect.Effect<Option.Option<LinkedHub>>;
+    /** The current link, then each change to it. */
+    readonly linkedHubChanges: Stream.Stream<Option.Option<LinkedHub>>;
     /** The hub's backlogs. Every call fails with code unavailable when there is no reachable hub. */
     readonly home: BacklogHome;
     readonly renewClaims: (input: BacklogRenewClaimsInput) => Effect.Effect<void, BacklogError>;
@@ -180,6 +183,11 @@ export const make = Effect.gen(function* () {
     ),
   );
   const linkRef = yield* Ref.make(stored);
+  const toLinkedHub = Option.map((link: StoredHubLink): LinkedHub => ({
+    environmentId: link.environmentId,
+    label: link.label,
+  }));
+  const linkedHubRef = yield* SubscriptionRef.make(toLinkedHub(stored));
   const stateRef = yield* Ref.make(IDLE);
   // One dial at a time; calls that arrive meanwhile share its result.
   const dialLock = yield* Semaphore.make(1);
@@ -485,6 +493,7 @@ export const make = Effect.gen(function* () {
         yield* closeConnection((yield* Ref.get(stateRef)).connection);
         yield* Ref.set(stateRef, IDLE);
         yield* Ref.set(linkRef, next);
+        yield* SubscriptionRef.set(linkedHubRef, toLinkedHub(next));
       }),
     );
 
@@ -585,11 +594,8 @@ export const make = Effect.gen(function* () {
   );
 
   return BacklogHubClient.of({
-    linkedHub: Ref.get(linkRef).pipe(
-      Effect.map(
-        Option.map((stored) => ({ environmentId: stored.environmentId, label: stored.label })),
-      ),
-    ),
+    linkedHub: Ref.get(linkRef).pipe(Effect.map(toLinkedHub)),
+    linkedHubChanges: SubscriptionRef.changes(linkedHubRef),
     home,
     renewClaims: (input) => call((client) => client[WS_METHODS.backlogRenewClaims](input)),
     connections: () => Stream.fromPubSub(connected),

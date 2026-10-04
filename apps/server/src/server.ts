@@ -76,6 +76,7 @@ import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
+import * as HeldAgentMessageNotifier from "./relay/HeldAgentMessageNotifier.ts";
 import * as AgentMessageService from "./agentMessages/AgentMessageService.ts";
 import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
 import { ProviderRegistryLive } from "./provider/Layers/ProviderRegistry.ts";
@@ -507,10 +508,12 @@ const ProviderInstallationRefreshLive = Layer.effectDiscard(
 );
 
 const RuntimeCoreDependenciesBaseLive = Layer.mergeAll(
-  AgentAwarenessRelay.layer,
   // The backlog fleet link: agents here reach a linked hub's backlogs, and
-  // message agents on other linked machines through it.
-  AgentMessageService.fleetLayer,
+  // message agents on other linked machines through it. Messages held here
+  // alert the user's phones through the awareness relay.
+  HeldAgentMessageNotifier.layer.pipe(
+    Layer.provideMerge(Layer.merge(AgentAwarenessRelay.layer, AgentMessageService.fleetLayer)),
+  ),
   ThreadSettlementWorkerLive,
   Layer.effectDiscard(StorageCleanup.make.pipe(Effect.flatMap((service) => service.start()))).pipe(
     Layer.provide(ProjectionStoreV2.layer),

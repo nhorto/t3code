@@ -80,6 +80,32 @@ class AgentNotificationsTest {
   }
 
   @Test
+  fun alertOnlyMessageOpensMessagesAndLeavesTheOngoingCard() {
+    AgentNotifications.receive(context, update("running", true))
+    AgentNotifications.receive(
+      context,
+      mapOf(
+        "device_id" to "device",
+        "user_id" to "user",
+        "updated_at" to System.currentTimeMillis().toString(),
+        "alert_id" to "held",
+        "alert_group" to "held/environment/thread",
+        "alert_title" to "Agent message held: Codex → Claude",
+        "alert_body" to "Can you rerun the tests?",
+        "alert_path" to "/backlog/messages",
+      ),
+      updateCard = false,
+    )
+    val card = manager.activeNotifications.single { it.tag == "t3-agent-activity" }
+    assertTrue(card.notification.flags and Notification.FLAG_ONGOING_EVENT != 0)
+    val alert = manager.activeNotifications.single { it.id == "held".hashCode() }
+    assertEquals(
+      "t3code-dev://backlog/messages",
+      shadowOf(alert.notification.contentIntent).savedIntent.dataString
+    )
+  }
+
+  @Test
   fun alertsStackByThreadGroup() {
     AgentNotifications.receive(context, update("grouped", false))
     assertEquals("environment/thread", manager.activeNotifications.single().notification.group)

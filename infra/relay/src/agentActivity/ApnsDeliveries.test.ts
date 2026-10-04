@@ -2091,3 +2091,72 @@ describe("signed APNs registration metadata", () => {
     );
   });
 });
+
+describe("held agent message alerts", () => {
+  const notification = {
+    environmentId: state.environmentId,
+    threadId: state.threadId,
+    title: "Agent message held: Codex → Claude",
+    body: "Can you rerun the tests?",
+    count: 1,
+    messageId: "message-1",
+    deepLink: "/backlog/messages" as const,
+  };
+
+  it.effect("queues an alert that opens Messages, then delivers it while alerts stay on", () => {
+    const queuedJobs: Array<SignedApnsDeliveryJob> = [];
+    const pushTarget = { ...target, push_token: "push" };
+    let sent = 0;
+    return Effect.gen(function* () {
+      const service = yield* ApnsDeliveries.ApnsDeliveries;
+      yield* service.sendHeldAgentMessageForTarget({ target: pushTarget, notification });
+      expect(queuedJobs).toHaveLength(1);
+      expect(queuedJobs[0]?.payload).toMatchObject({
+        kind: "push_notification",
+        notification: {
+          title: notification.title,
+          body: notification.body,
+          threadId: notification.threadId,
+          deepLink: "/backlog/messages",
+        },
+      });
+      // No activity state to recheck: the job only needs alerts still enabled.
+      yield* service.processSignedJob(queuedJobs[0]);
+      expect(sent).toBe(1);
+    }).pipe(
+      Effect.provide(
+        makeLayer({
+          attempts: [],
+          queuedJobs,
+          config: signingConfig,
+          currentTargets: [pushTarget],
+          currentActivityStates: [],
+          execute: (request) =>
+            Effect.sync(() => {
+              sent++;
+              return HttpClientResponse.fromWeb(request, new Response("", { status: 200 }));
+            }),
+        }),
+      ),
+    );
+  });
+
+  it.effect("skips devices without a push token or with notifications off", () => {
+    const queuedJobs: Array<SignedApnsDeliveryJob> = [];
+    return Effect.gen(function* () {
+      const service = yield* ApnsDeliveries.ApnsDeliveries;
+      expect(yield* service.sendHeldAgentMessageForTarget({ target, notification })).toBeNull();
+      expect(
+        yield* service.sendHeldAgentMessageForTarget({
+          target: {
+            ...target,
+            push_token: "push",
+            preferences_json: notificationsDisabledPreferences,
+          },
+          notification,
+        }),
+      ).toBeNull();
+      expect(queuedJobs).toHaveLength(0);
+    }).pipe(Effect.provide(makeLayer({ attempts: [], queuedJobs })));
+  });
+});

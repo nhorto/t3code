@@ -28,7 +28,7 @@ const IssueRef = TrimmedNonEmptyString.annotate({
 });
 const BacklogRef = TrimmedNonEmptyString.annotate({
   description:
-    "A backlog id, or its key such as WINE or INBOX (case-insensitive). When this machine is linked to a hub, a key both machines use (every machine has an INBOX) is ambiguous; pass the id.",
+    "A backlog id, or its key such as WINE or INBOX (case-insensitive). When this machine is linked to a hub, INBOX is the hub's Inbox, the one for every machine; another key both machines use is ambiguous, so pass the id.",
 });
 const ProjectTarget = ProjectId.annotate({
   description:
@@ -92,7 +92,7 @@ const BacklogGuideTool = Tool.make("backlog_guide", {
 const ListBacklogsTool = Tool.make("backlog_list_backlogs", {
   ...shared,
   description:
-    "List the backlogs: this machine's Inbox and project backlogs, plus the backlog hub's when this machine is linked to one (host says which). Keys such as WINE prefix issue keys (WINE-12). Both machines have an INBOX: a key that exists on both is ambiguous, so pass the id. A backlog with movedTo lives on that machine now; its copy here is read-only.",
+    "List the backlogs: this machine's Inbox and project backlogs, plus the backlog hub's when this machine is linked to one (host says which). Keys such as WINE prefix issue keys (WINE-12). When linked, there is one Inbox, the hub's, and INBOX-n always names its issues; another key that exists on both machines is ambiguous, so pass the id. A backlog with movedTo lives on that machine now; its copy here is read-only.",
   success: Schema.Struct({
     backlogs: Schema.Array(Schema.Struct({ ...Backlog.fields, host: Host })),
     hub: HubNote,
