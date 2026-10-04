@@ -834,7 +834,9 @@ export const make = Effect.gen(function* () {
                       proofKeyThumbprint: input.proofKeyThumbprint,
                       ttl: Duration.hours(1),
                     }
-                  : isBacklogLinkOnly(grantedScopes)
+                  : // Only a link minted backlog-only earns a year; a standard
+                    // link narrowed to backlog scopes keeps the standard lifetime.
+                    isBacklogLinkOnly(grant.scopes) && isBacklogLinkOnly(grantedScopes)
                     ? { ttl: BACKLOG_LINK_SESSION_TTL }
                     : {}),
                 // Desktop restarts forget the previous bearer token. Replace

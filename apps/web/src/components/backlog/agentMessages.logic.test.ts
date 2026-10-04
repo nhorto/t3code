@@ -4,6 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   agentMessagePreview,
   buildAgentMessageFeed,
+  canActOnAgentMessage,
   countHeldAgentMessageRows,
 } from "./agentMessages.logic";
 
@@ -30,6 +31,42 @@ function message(id: string, minute: number, overrides: Partial<AgentMessage> = 
 }
 
 describe("buildAgentMessageFeed", () => {
+  it("shows a message relayed between machines once, as the receiving machine logged it", () => {
+    const relayed = {
+      from: { environmentId: ex, threadId: ThreadId.make("thread-a"), label: "A" },
+      to: { environmentId: mac, threadId: ThreadId.make("thread-b"), label: "B" },
+    };
+    const senderCopy = message("relayed", 3, { ...relayed, status: "held" });
+    const receiverCopy = message("relayed", 3, {
+      ...relayed,
+      from: { ...relayed.from, machine: "EX" },
+      status: "held",
+    });
+    for (const sources of [
+      [
+        { environmentId: ex, feed: { messages: [senderCopy] } },
+        { environmentId: mac, feed: { messages: [receiverCopy] } },
+      ],
+      [
+        { environmentId: mac, feed: { messages: [receiverCopy] } },
+        { environmentId: ex, feed: { messages: [senderCopy] } },
+      ],
+    ]) {
+      const view = buildAgentMessageFeed({ sources, machineLabel: (id) => id });
+      expect(view.held.map((row) => row.environmentId)).toEqual([mac]);
+      expect(canActOnAgentMessage(view.held[0]!)).toBe(true);
+      expect(countHeldAgentMessageRows(sources)).toBe(1);
+    }
+
+    // Without the receiving machine connected, the sender's copy shows but cannot be released.
+    const senderOnly = buildAgentMessageFeed({
+      sources: [{ environmentId: ex, feed: { messages: [senderCopy] } }],
+      machineLabel: (id) => id,
+    });
+    expect(senderOnly.held.map((row) => row.environmentId)).toEqual([ex]);
+    expect(canActOnAgentMessage(senderOnly.held[0]!)).toBe(false);
+  });
+
   it("merges machines, lists held oldest first and the rest newest first", () => {
     const sources = [
       {

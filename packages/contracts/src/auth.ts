@@ -1,4 +1,5 @@
 import * as Schema from "effect/Schema";
+import * as SchemaTransformation from "effect/SchemaTransformation";
 import * as HttpApiSchema from "effect/unstable/httpapi/HttpApiSchema";
 
 import {
@@ -247,15 +248,70 @@ export const AuthPairingCredentialResult = Schema.Struct({
 });
 export type AuthPairingCredentialResult = typeof AuthPairingCredentialResult.Type;
 
+/**
+ * Scopes released clients decode as a closed set. Listings send only these in
+ * `scopes` and anything newer in `additionalScopes`, which those clients
+ * ignore, so a backlog link in Connections cannot break their decoding.
+ */
+const LEGACY_LISTED_SCOPES: ReadonlyArray<string> = [
+  AuthOrchestrationReadScope,
+  AuthOrchestrationOperateScope,
+  AuthTerminalOperateScope,
+  AuthReviewWriteScope,
+  AuthAccessReadScope,
+  AuthAccessWriteScope,
+  AuthRelayReadScope,
+  AuthRelayWriteScope,
+];
+const isAuthEnvironmentScope = Schema.is(AuthEnvironmentScope);
+
+/** A listing's scopes over the wire; see LEGACY_LISTED_SCOPES. */
+const ListedScopesWire = {
+  scopes: Schema.Array(Schema.String),
+  additionalScopes: Schema.optionalKey(Schema.Array(Schema.String)),
+};
+
+/** Keeps the scopes this build knows and drops the rest, so a newer server cannot break it. */
+function decodeListedScopes<
+  T extends {
+    readonly scopes: ReadonlyArray<string>;
+    readonly additionalScopes?: ReadonlyArray<string>;
+  },
+>({ additionalScopes, scopes, ...rest }: T) {
+  return {
+    ...rest,
+    scopes: [...scopes, ...(additionalScopes ?? [])].filter(isAuthEnvironmentScope),
+  };
+}
+
+function encodeListedScopes<T extends { readonly scopes: ReadonlyArray<string> }>({
+  scopes,
+  ...rest
+}: T) {
+  const additional = scopes.filter((scope) => !LEGACY_LISTED_SCOPES.includes(scope));
+  return {
+    ...rest,
+    scopes: scopes.filter((scope) => LEGACY_LISTED_SCOPES.includes(scope)),
+    ...(additional.length > 0 ? { additionalScopes: additional } : {}),
+  };
+}
+
 // Read models contain metadata only. Credentials are returned by creation alone.
-export const AuthPairingLink = Schema.Struct({
+const AuthPairingLinkFields = {
   id: TrimmedNonEmptyString,
-  scopes: AuthEnvironmentScopes,
   subject: TrimmedNonEmptyString,
   label: Schema.optionalKey(TrimmedNonEmptyString),
   createdAt: Schema.DateTimeUtc,
   expiresAt: Schema.DateTimeUtc,
-});
+};
+export const AuthPairingLink = Schema.toEncoded(
+  Schema.Struct({ ...AuthPairingLinkFields, ...ListedScopesWire }),
+).pipe(
+  Schema.decodeTo(
+    Schema.Struct({ ...AuthPairingLinkFields, scopes: AuthEnvironmentScopes }),
+    SchemaTransformation.transform({ decode: decodeListedScopes, encode: encodeListedScopes }),
+  ),
+);
 export type AuthPairingLink = typeof AuthPairingLink.Type;
 
 export const AuthClientMetadata = Schema.Struct({
@@ -268,10 +324,9 @@ export const AuthClientMetadata = Schema.Struct({
 });
 export type AuthClientMetadata = typeof AuthClientMetadata.Type;
 
-export const AuthClientSession = Schema.Struct({
+const AuthClientSessionFields = {
   sessionId: AuthSessionId,
   subject: TrimmedNonEmptyString,
-  scopes: AuthEnvironmentScopes,
   method: ServerAuthSessionMethod,
   client: AuthClientMetadata,
   issuedAt: Schema.DateTimeUtc,
@@ -279,7 +334,15 @@ export const AuthClientSession = Schema.Struct({
   lastConnectedAt: Schema.NullOr(Schema.DateTimeUtc),
   connected: Schema.Boolean,
   current: Schema.Boolean,
-});
+};
+export const AuthClientSession = Schema.toEncoded(
+  Schema.Struct({ ...AuthClientSessionFields, ...ListedScopesWire }),
+).pipe(
+  Schema.decodeTo(
+    Schema.Struct({ ...AuthClientSessionFields, scopes: AuthEnvironmentScopes }),
+    SchemaTransformation.transform({ decode: decodeListedScopes, encode: encodeListedScopes }),
+  ),
+);
 export type AuthClientSession = typeof AuthClientSession.Type;
 
 export const AuthAccessSnapshot = Schema.Struct({

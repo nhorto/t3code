@@ -22,6 +22,7 @@ export const ClientCacheKind = Schema.Literals([
   "server-config",
   "vcs-refs",
   "project-favicon",
+  "backlog-board",
 ]);
 export type ClientCacheKind = typeof ClientCacheKind.Type;
 

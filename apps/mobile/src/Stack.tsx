@@ -30,6 +30,7 @@ import {
 } from "./components/RenderErrorBoundary";
 import { ArchivedThreadsRouteScreen } from "./features/archive/ArchivedThreadsRouteScreen";
 import { BacklogIssueRouteScreen } from "./features/backlog/BacklogIssueRouteScreen";
+import { BacklogMessagesRouteScreen } from "./features/backlog/BacklogMessagesRouteScreen";
 import { BacklogQuickAddSheet } from "./features/backlog/BacklogQuickAddSheet";
 import { BacklogRouteScreen } from "./features/backlog/BacklogRouteScreen";
 import { useAgentNotificationNavigation } from "./features/agent-awareness/notificationNavigation";
@@ -824,6 +825,11 @@ const RootStackConfig = createNativeStackNavigator({
     Backlog: createNativeStackScreen({
       screen: BacklogRouteScreen,
       linking: "backlog",
+      options: GLASS_HEADER_OPTIONS,
+    }),
+    BacklogMessages: createNativeStackScreen({
+      screen: BacklogMessagesRouteScreen,
+      linking: "backlog/messages",
       options: GLASS_HEADER_OPTIONS,
     }),
     BacklogIssue: createNativeStackScreen({

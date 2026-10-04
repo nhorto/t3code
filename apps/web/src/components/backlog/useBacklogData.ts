@@ -59,6 +59,7 @@ export function useBacklogSources(): BacklogSources {
           connectionPhase: environment?.connection.phase ?? null,
           hasBoard: board.board !== null,
           failed: board.error !== null,
+          fromCache: board.board?.fromCache === true,
         }),
         board: board.board,
         error: board.error,

@@ -10,11 +10,13 @@ import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { useCallback, useMemo } from "react";
 
+import { relativeTime } from "../../lib/time";
 import { backlogEnvironment } from "../../state/backlog";
 import { useProjects } from "../../state/entities";
 import { useEnvironments } from "../../state/environments";
 import { useMobileProjectGroupingSettings } from "../../state/project-grouping";
 import {
+  backlogReadOnlyReason,
   buildBacklogScopes,
   mergeBacklogIssuesById,
   type BacklogEnvironmentAvailability,
@@ -60,8 +62,9 @@ export interface BacklogEnvironmentNotice {
 }
 
 /**
- * Every connected environment's board, the picker scopes built over them,
- * and honest notices for environments that are offline or failed to load.
+ * Every environment's board, the picker scopes built over them, and honest
+ * notices for environments that are offline or failed to load. An offline
+ * environment shows the board this device last saved for it, read-only.
  * Environments whose server predates Backlog are left out, named only in
  * `unsupportedLabels`.
  */
@@ -76,7 +79,19 @@ export function useBacklogBoards() {
         .map((environment) => environment.environmentId),
     [environments],
   );
-  const results = useAtomValue(backlogBoardsAtom(JSON.stringify(connectedEnvironmentIds)));
+  // Sorted, so the subscription key does not change with connection order.
+  const boardEnvironmentIds = useMemo(
+    () =>
+      environments
+        .filter(
+          (environment) =>
+            environment.entry.enabled && environment.connection.phase !== "unsupported",
+        )
+        .map((environment) => environment.environmentId)
+        .sort((left, right) => left.localeCompare(right)),
+    [environments],
+  );
+  const results = useAtomValue(backlogBoardsAtom(JSON.stringify(boardEnvironmentIds)));
   const labelById = useMemo(
     () =>
       new Map(environments.map((environment) => [environment.environmentId, environment.label])),
@@ -137,7 +152,7 @@ export function useBacklogBoards() {
         const phase = environment.connection.phase;
         const state =
           phase === "connected"
-            ? result?.board
+            ? result?.board && result.board.fromCache !== true
               ? "ready"
               : result?.error
                 ? "failed"
@@ -164,6 +179,7 @@ export function useBacklogBoards() {
           ]
         : [],
     );
+    const boardById = new Map(results.map((result) => [result.environmentId, result.board]));
     const offline = environments
       .filter(
         (environment) =>
@@ -171,11 +187,23 @@ export function useBacklogBoards() {
           environment.connection.phase !== "connected" &&
           environment.connection.phase !== "unsupported",
       )
-      .map((environment) => ({
-        environmentId: environment.environmentId,
-        label: environment.label,
-        message: "Unavailable until it reconnects.",
-      }));
+      .map((environment) => {
+        const board = boardById.get(environment.environmentId) ?? null;
+        return {
+          environmentId: environment.environmentId,
+          label: environment.label,
+          message:
+            board === null
+              ? "Unavailable until it reconnects."
+              : (backlogReadOnlyReason({
+                  connected: false,
+                  board,
+                  backlog: null,
+                  label: environment.label,
+                  formatTime: (iso) => `${relativeTime(iso)} ago`,
+                }) ?? "Unavailable until it reconnects."),
+        };
+      });
     return [...failed, ...offline];
   }, [environments, labelById, results]);
 
@@ -189,6 +217,11 @@ export function useBacklogBoards() {
     environmentAvailability,
     environmentLabel,
     /** True until every connected environment has sent its first snapshot. */
-    isLoading: results.some((result) => result.board === null && result.error === null),
+    isLoading: results.some(
+      (result) =>
+        result.board === null &&
+        result.error === null &&
+        connectedEnvironmentIds.includes(result.environmentId),
+    ),
   };
 }

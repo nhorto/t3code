@@ -6,12 +6,16 @@ import {
   BacklogError,
   BacklogIssue,
   BacklogIssueLink,
+  BacklogMovedTo,
+  backlogMovedMessage,
   compareBacklogIssuesForClaim,
   deriveBacklogKey,
   isBacklogStatusClosed,
   parseBacklogIssueKey,
   type BacklogActivityKind,
   type BacklogClaimResult,
+  type BacklogExport,
+  type BacklogExportInput,
   type BacklogChildInput as ContractBacklogChildInput,
   type BacklogClaimInput as ContractBacklogClaimInput,
   type BacklogClaimNextInput as ContractBacklogClaimNextInput,
@@ -32,6 +36,7 @@ import {
   type BacklogUpdateBacklogInput,
   type BacklogUpdateIssueInput,
   type OrchestrationV2ThreadShell,
+  type BacklogId,
   type ProjectId,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -183,6 +188,22 @@ export class BacklogService extends Context.Service<
     ) => Effect.Effect<ReadonlyArray<BacklogIssue>, BacklogError>;
     /** One snapshot of every backlog and issue, then row deltas. */
     readonly subscribe: () => Stream.Stream<BacklogStreamEvent, BacklogError>;
+    /**
+     * Everything a project backlog holds, for moving it to another environment.
+     * Leaves this copy as a read-only redirect to `to`. Refused while any issue
+     * is claimed.
+     */
+    readonly exportBacklog: (
+      input: BacklogExportInput,
+    ) => Effect.Effect<BacklogExport, BacklogError>;
+    /**
+     * Takes in a backlog exported elsewhere, keeping ids, numbers and keys. A
+     * redirect left here by an earlier move of the same board is replaced.
+     * Refused when a live board for the repository or the key already exists.
+     */
+    readonly importBacklog: (input: BacklogExport) => Effect.Effect<Backlog, BacklogError>;
+    /** Makes a moved backlog live here again, undoing an export whose import failed. */
+    readonly restoreBacklog: (backlogId: BacklogId) => Effect.Effect<Backlog, BacklogError>;
   }
 >()("t3/backlog/BacklogService") {}
 
@@ -194,6 +215,7 @@ interface BacklogRow {
   readonly project_id: string | null;
   readonly repository_key: string | null;
   readonly next_number: number;
+  readonly moved_to_json: string | null;
   readonly created_at: string;
   readonly updated_at: string;
 }
@@ -240,17 +262,24 @@ const decodeActorJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Backlog
 const decodeLinksJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(Schema.Array(BacklogIssueLink)),
 );
+const encodeMovedToJson = Schema.encodeSync(Schema.fromJsonString(BacklogMovedTo));
+const decodeMovedToJson = Schema.decodeUnknownEffect(Schema.fromJsonString(BacklogMovedTo));
 
 const decodeBacklogRow = (row: BacklogRow) =>
-  decodeBacklog({
-    id: row.id,
-    kind: row.kind,
-    key: row.key,
-    title: row.title,
-    projectId: row.project_id,
-    repositoryKey: row.repository_key,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
+  Effect.gen(function* () {
+    return yield* decodeBacklog({
+      id: row.id,
+      kind: row.kind,
+      key: row.key,
+      title: row.title,
+      projectId: row.project_id,
+      repositoryKey: row.repository_key,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      ...(row.moved_to_json === null
+        ? {}
+        : { movedTo: yield* decodeMovedToJson(row.moved_to_json) }),
+    });
   });
 
 const decodeIssueRow = (row: IssueRow, blockedBy: ReadonlyArray<string>) =>
@@ -317,6 +346,16 @@ const conflict = (message: string, issueId?: BacklogIssueId) =>
   new BacklogError({ code: "conflict", message, ...(issueId ? { issueId } : {}) });
 const invalid = (message: string, issueId?: BacklogIssueId) =>
   new BacklogError({ code: "invalid", message, ...(issueId ? { issueId } : {}) });
+/** A moved backlog's copy here is a read-only redirect; the error says where it went. */
+const movedAway = (backlog: Backlog, issueId?: BacklogIssueId) =>
+  new BacklogError({
+    code: "conflict",
+    message: backlogMovedMessage(backlog),
+    ...(backlog.movedTo === undefined ? {} : { movedTo: backlog.movedTo }),
+    ...(issueId ? { issueId } : {}),
+  });
+const assertLive = (backlog: Backlog, issueId?: BacklogIssueId) =>
+  backlog.movedTo === undefined ? Effect.void : Effect.fail(movedAway(backlog, issueId));
 
 /**
  * Storage and decode failures are defects: the contract's error codes describe
@@ -409,6 +448,13 @@ const ensureSchema = Effect.gen(function* () {
     )
   `;
   yield* sql`CREATE INDEX IF NOT EXISTS backlog_activity_issue ON backlog_activity (issue_id)`;
+  // Added after the first release of the tables; databases from then lack it.
+  const backlogColumns = yield* sql<{
+    name: string;
+  }>`SELECT name FROM pragma_table_info('backlogs')`;
+  if (!backlogColumns.some((column) => column.name === "moved_to_json")) {
+    yield* sql`ALTER TABLE backlogs ADD COLUMN moved_to_json TEXT`;
+  }
 });
 
 export const layer = Layer.effect(
@@ -476,6 +522,21 @@ export const layer = Layer.effect(
       return yield* Effect.forEach(rows, (row) => decodeIssueRow(row, blockedBy.get(row.id) ?? []));
     });
 
+    /** Fails with where the issue's backlog went when it moved away. */
+    const assertIssueLive = (issueId: BacklogIssueId) =>
+      sql<BacklogRow>`
+        SELECT b.* FROM backlogs b JOIN backlog_issues i ON i.backlog_id = b.id
+        WHERE i.id = ${issueId}
+      `.pipe(
+        Effect.flatMap((rows) =>
+          rows[0] === undefined
+            ? Effect.void
+            : decodeBacklogRow(rows[0]).pipe(
+                Effect.flatMap((backlog) => assertLive(backlog, issueId)),
+              ),
+        ),
+      );
+
     const findIssue = (id: string) =>
       selectIssues(sql`i.id = ${id}`).pipe(Effect.map((rows) => rows[0] ?? null));
 
@@ -498,6 +559,8 @@ export const layer = Layer.effect(
       `.pipe(Effect.map((rows) => rows[0]?.count ?? 0));
 
     const filterClauses = (filters: BacklogIssueFilters) => [
+      // A moved backlog's copy here is a redirect, not work.
+      sql.literal("i.backlog_id NOT IN (SELECT id FROM backlogs WHERE moved_to_json IS NOT NULL)"),
       ...(filters.backlogId === undefined ? [] : [sql`i.backlog_id = ${filters.backlogId}`]),
       ...(filters.status === undefined || filters.status.length === 0
         ? []
@@ -802,6 +865,7 @@ export const layer = Layer.effect(
       actor: BacklogActor,
       touched: Touched,
     ) {
+      yield* assertIssueLive(issueId);
       const current = yield* now;
       const at = DateTime.formatIso(current);
       const claimed = yield* sql`
@@ -866,6 +930,24 @@ export const layer = Layer.effect(
       return { alreadyHeld: false };
     });
 
+    const boardSnapshot = Effect.all({
+      backlogs: selectBacklogs(sql.literal("1=1")),
+      issues: selectIssues(null),
+    }).pipe(
+      Effect.map((board): BacklogStreamEvent => ({ type: "snapshot", ...board })),
+      backlogErrorsOnly,
+    );
+
+    /** Removes a backlog with its issues, their edges and history. */
+    const deleteBacklogRows = (backlogId: string) =>
+      Effect.gen(function* () {
+        const owned = sql`SELECT id FROM backlog_issues WHERE backlog_id = ${backlogId}`;
+        yield* sql`DELETE FROM backlog_activity WHERE issue_id IN (${owned})`;
+        yield* sql`DELETE FROM backlog_issue_blockers WHERE issue_id IN (${owned})`;
+        yield* sql`DELETE FROM backlog_issues WHERE backlog_id = ${backlogId}`;
+        yield* sql`DELETE FROM backlogs WHERE id = ${backlogId}`;
+      });
+
     // Inbox: one per environment, created on first start.
     yield* ensureSchema;
     yield* Effect.gen(function* () {
@@ -896,6 +978,7 @@ export const layer = Layer.effect(
         const rows = yield* selectBacklogs(sql`id = ${trimmed} OR key = ${trimmed.toUpperCase()}`);
         const backlog = rows.find((row) => row.id === trimmed) ?? rows[0];
         if (backlog === undefined) return yield* notFound(`Backlog ${trimmed} not found.`);
+        yield* assertLive(backlog);
         return backlog;
       }).pipe(backlogErrorsOnly);
 
@@ -984,6 +1067,7 @@ export const layer = Layer.effect(
       mutate((touched) =>
         Effect.gen(function* () {
           const backlog = yield* loadBacklog(input.backlogId);
+          yield* assertLive(backlog);
           const key = input.key ?? backlog.key;
           const title = input.title ?? backlog.title;
           if (key === backlog.key && title === backlog.title) return backlog;
@@ -1008,7 +1092,13 @@ export const layer = Layer.effect(
       ).pipe(backlogErrorsOnly);
 
     const listIssues: BacklogService["Service"]["listIssues"] = (filters = {}) =>
-      selectIssues(sql.and(filterClauses(filters))).pipe(backlogErrorsOnly);
+      Effect.gen(function* () {
+        if (filters.backlogId !== undefined) {
+          const backlog = yield* findBacklog(filters.backlogId);
+          if (backlog !== null) yield* assertLive(backlog);
+        }
+        return yield* selectIssues(sql.and(filterClauses(filters)));
+      }).pipe(backlogErrorsOnly);
 
     const getIssue: BacklogService["Service"]["getIssue"] = ({ issueId }) =>
       Effect.gen(function* () {
@@ -1056,7 +1146,9 @@ export const layer = Layer.effect(
               : `Issue ${ref.trim()} not found.`,
           );
         }
-        return rows[0].id as BacklogIssueId;
+        const id = rows[0].id as BacklogIssueId;
+        yield* assertIssueLive(id);
+        return id;
       }).pipe(backlogErrorsOnly);
 
     const createIssue: BacklogService["Service"]["createIssue"] = (input, actor) =>
@@ -1069,6 +1161,7 @@ export const layer = Layer.effect(
               : input.repository !== undefined
                 ? yield* ensureRepositoryBacklog(input.repository)
                 : yield* inbox;
+        yield* assertLive(backlog);
         const id = yield* mutate((touched) =>
           Effect.gen(function* () {
             const at = DateTime.formatIso(yield* now);
@@ -1091,6 +1184,7 @@ export const layer = Layer.effect(
           Effect.gen(function* () {
             const parent = yield* loadIssue(parentId);
             const backlog = yield* loadBacklog(parent.backlogId);
+            yield* assertLive(backlog, parentId);
             const at = DateTime.formatIso(yield* now);
             const ids: BacklogIssueId[] = [];
             for (const child of children) {
@@ -1134,11 +1228,13 @@ export const layer = Layer.effect(
         const id = yield* mutate((touched) =>
           Effect.gen(function* () {
             const issue = yield* loadIssue(input.issueId);
+            yield* assertIssueLive(issue.id);
             const at = DateTime.formatIso(yield* now);
             const target =
               targetId === undefined || targetId === issue.backlogId
                 ? null
                 : yield* loadBacklog(targetId);
+            if (target !== null) yield* assertLive(target, issue.id);
 
             if (target !== null) {
               const children =
@@ -1269,6 +1365,7 @@ export const layer = Layer.effect(
         const activityId = yield* mutate((touched) =>
           Effect.gen(function* () {
             yield* loadIssue(input.issueId);
+            yield* assertIssueLive(input.issueId);
             const at = DateTime.formatIso(yield* now);
             const id = yield* recordActivity({
               issueId: input.issueId,
@@ -1318,6 +1415,7 @@ export const layer = Layer.effect(
         yield* mutate((touched) =>
           Effect.gen(function* () {
             const issue = yield* loadIssue(input.issueId);
+            yield* assertIssueLive(issue.id);
             if (issue.claim === null)
               return yield* conflict(`${issue.key} is not claimed.`, issue.id);
             const holder = isHolder(issue.claim.actor, actor);
@@ -1364,6 +1462,7 @@ export const layer = Layer.effect(
         yield* mutate((touched) =>
           Effect.gen(function* () {
             const issue = yield* loadIssue(issueId);
+            yield* assertIssueLive(issueId);
             yield* appendLink(issue, link, actor, DateTime.formatIso(yield* now), touched);
           }),
         );
@@ -1392,17 +1491,201 @@ export const layer = Layer.effect(
         return ids.length === 0 ? [] : yield* selectIssues(sql.in("i.id", ids));
       }).pipe(backlogErrorsOnly);
 
+    const exportBacklog: BacklogService["Service"]["exportBacklog"] = ({ backlogId, to }) =>
+      mutate((touched) =>
+        Effect.gen(function* () {
+          const backlog = yield* loadBacklog(backlogId);
+          if (backlog.kind !== "project") {
+            return yield* invalid("Only project boards move; every machine keeps its own Inbox.");
+          }
+          if (backlog.repositoryKey === null) {
+            return yield* invalid(
+              "Only a board for a git repository can move: the other machine finds its project by the repository.",
+            );
+          }
+          yield* assertLive(backlog);
+          const issues = yield* selectIssues(sql`i.backlog_id = ${backlog.id}`);
+          const claimed = issues.filter((issue) => issue.claim !== null);
+          if (claimed.length > 0) {
+            return yield* conflict(
+              `Release ${claimed.map((issue) => issue.key).join(", ")} first: a claimed issue cannot move.`,
+            );
+          }
+          const bodies = new Map(
+            (yield* sql<{ id: string; body: string }>`
+              SELECT id, body FROM backlog_issues WHERE backlog_id = ${backlog.id}
+            `).map((row) => [row.id, row.body]),
+          );
+          const activityRows = yield* sql<ActivityRow>`
+            SELECT a.* FROM backlog_activity a JOIN backlog_issues i ON i.id = a.issue_id
+            WHERE i.backlog_id = ${backlog.id}
+            ORDER BY a.at, a.rowid
+          `;
+          const [counter] = yield* sql<{ next_number: number }>`
+            SELECT next_number FROM backlogs WHERE id = ${backlog.id}
+          `;
+          const movedAt = DateTime.formatIso(yield* now);
+          yield* sql`
+            UPDATE backlogs
+            SET moved_to_json = ${encodeMovedToJson({ ...to, movedAt })}, updated_at = ${movedAt}
+            WHERE id = ${backlog.id}
+          `;
+          touched.backlogs.add(backlog.id);
+          return {
+            backlog,
+            nextNumber: counter?.next_number ?? 1,
+            issues: issues.map((issue) => ({ ...issue, body: bodies.get(issue.id) ?? "" })),
+            activity: yield* Effect.forEach(activityRows, decodeActivityRow),
+          } satisfies BacklogExport;
+        }),
+      ).pipe(backlogErrorsOnly);
+
+    const importBacklog: BacklogService["Service"]["importBacklog"] = (payload) =>
+      Effect.gen(function* () {
+        const incoming = payload.backlog;
+        const repositoryKey = incoming.repositoryKey;
+        if (incoming.kind !== "project" || repositoryKey === null) {
+          return yield* invalid("Only a project board for a git repository can move.");
+        }
+        // Read projects before the transaction: the project service has its own storage.
+        const project = (yield* projects.listShells()).find(
+          (shell) => shell.repositoryIdentity?.canonicalKey === repositoryKey,
+        );
+        const replaced = yield* mutate((touched) =>
+          Effect.gen(function* () {
+            const existing = yield* selectBacklogs(
+              sql`id = ${incoming.id} OR repository_key = ${repositoryKey} OR key = ${incoming.key}`,
+            );
+            const live = existing.find(
+              (backlog) =>
+                backlog.movedTo === undefined &&
+                (backlog.id === incoming.id || backlog.repositoryKey === repositoryKey),
+            );
+            if (live !== undefined) {
+              return yield* conflict(
+                `This machine already has a board for that repository (${live.key}).`,
+              );
+            }
+            // A redirect left by an earlier move of this board gives way to the board itself.
+            const redirects = existing.filter(
+              (backlog) =>
+                backlog.movedTo !== undefined &&
+                (backlog.id === incoming.id || backlog.repositoryKey === repositoryKey),
+            );
+            const clash = existing.find(
+              (backlog) =>
+                backlog.key === incoming.key &&
+                !redirects.some((redirect) => redirect.id === backlog.id),
+            );
+            if (clash !== undefined) {
+              return yield* conflict(
+                `This machine already uses the key ${incoming.key}. Rename one of the keys first.`,
+              );
+            }
+            for (const redirect of redirects) yield* deleteBacklogRows(redirect.id);
+
+            const issueIds = payload.issues.map((issue) => issue.id);
+            if (issueIds.length > 0) {
+              const taken = yield* sql<{ id: string }>`
+                SELECT id FROM backlog_issues WHERE ${sql.in("id", issueIds)}
+              `;
+              if (taken[0] !== undefined) {
+                return yield* conflict(`Issue ${taken[0].id} already exists on this machine.`);
+              }
+            }
+            const projectTaken =
+              project === undefined
+                ? true
+                : (yield* sql`SELECT 1 FROM backlogs WHERE project_id = ${project.id}`).length > 0;
+            const at = DateTime.formatIso(yield* now);
+            yield* sql`INSERT INTO backlogs ${sql.insert({
+              id: incoming.id,
+              kind: "project",
+              key: incoming.key,
+              title: incoming.title,
+              project_id: projectTaken ? null : project!.id,
+              repository_key: repositoryKey,
+              next_number: payload.nextNumber,
+              created_at: incoming.createdAt,
+              updated_at: at,
+            })}`;
+            touched.backlogs.add(incoming.id);
+            for (const issue of payload.issues) {
+              yield* sql`INSERT INTO backlog_issues ${sql.insert({
+                id: issue.id,
+                backlog_id: incoming.id,
+                number: issue.number,
+                title: issue.title,
+                body: issue.body,
+                type: issue.type,
+                status: issue.status,
+                priority: issue.priority,
+                parent_id: issue.parentId,
+                links_json: encodeLinksJson(issue.links),
+                created_by_json: encodeActorJson(issue.createdBy),
+                created_at: issue.createdAt,
+                updated_at: issue.updatedAt,
+                closed_at: issue.closedAt,
+              })}`;
+              touched.issues.add(issue.id);
+            }
+            const edges = payload.issues.flatMap((issue) =>
+              issue.blockedBy.map((blockerId) => ({ issue_id: issue.id, blocker_id: blockerId })),
+            );
+            if (edges.length > 0)
+              yield* sql`INSERT INTO backlog_issue_blockers ${sql.insert(edges)}`;
+            for (const entry of payload.activity) {
+              yield* sql`INSERT INTO backlog_activity ${sql.insert({
+                id: entry.id,
+                issue_id: entry.issueId,
+                kind: entry.kind,
+                actor_json: encodeActorJson(entry.actor),
+                at: entry.at,
+                text: entry.text,
+                from_status: entry.fromStatus,
+                to_status: entry.toStatus,
+              })}`;
+            }
+            return redirects.length > 0;
+          }),
+        );
+        // The stream has no removal event, so a removed redirect resets subscribers' boards.
+        if (replaced) yield* PubSub.publish(events, yield* boardSnapshot);
+        return yield* loadBacklog(incoming.id);
+      }).pipe(backlogErrorsOnly);
+
+    const restoreBacklog: BacklogService["Service"]["restoreBacklog"] = (backlogId) =>
+      mutate((touched) =>
+        Effect.gen(function* () {
+          const backlog = yield* loadBacklog(backlogId);
+          if (backlog.movedTo === undefined) return backlog;
+          const clash = yield* sql`
+            SELECT 1 FROM backlogs
+            WHERE id <> ${backlog.id} AND moved_to_json IS NULL
+              AND repository_key IS ${backlog.repositoryKey}
+          `;
+          if (clash.length > 0) {
+            return yield* conflict("This machine already has a live board for that repository.");
+          }
+          const at = DateTime.formatIso(yield* now);
+          yield* sql`
+            UPDATE backlogs SET moved_to_json = NULL, updated_at = ${at} WHERE id = ${backlog.id}
+          `;
+          touched.backlogs.add(backlog.id);
+          return yield* loadBacklog(backlog.id);
+        }),
+      ).pipe(backlogErrorsOnly);
+
     const subscribe: BacklogService["Service"]["subscribe"] = () =>
       Stream.unwrap(
         Effect.gen(function* () {
           // Subscribe before taking the snapshot so a change landing between
           // the two is buffered by the subscription rather than dropped.
           const subscription = yield* PubSub.subscribe(events);
-          const snapshot = Effect.all({
-            backlogs: listBacklogs(),
-            issues: selectIssues(null).pipe(backlogErrorsOnly),
-          }).pipe(Effect.map((board): BacklogStreamEvent => ({ type: "snapshot", ...board })));
-          return Stream.concat(Stream.fromEffect(snapshot), Stream.fromSubscription(subscription));
+          return Stream.concat(
+            Stream.fromEffect(boardSnapshot),
+            Stream.fromSubscription(subscription),
+          );
         }),
       );
 
@@ -1412,18 +1695,28 @@ export const layer = Layer.effect(
      * deadline passes. Holders on other environments are renewed by their own
      * server over the hub link, or whenever they call a backlog tool.
      */
+    let lastKeeperPassMs: number | null = null;
     const keepLeases = Effect.gen(function* () {
       const claimed = yield* sql<{ claim_thread_id: string | null }>`
         SELECT DISTINCT claim_thread_id FROM backlog_issues WHERE claim_actor_json IS NOT NULL
       `;
       const nowMs = (yield* now).epochMilliseconds;
+      // After a restart or a sleep longer than a lease, holders on other
+      // machines have had no chance to renew: give them one lease to do so
+      // before their claims can lapse.
+      const catchingUp =
+        lastKeeperPassMs === null || nowMs - lastKeeperPassMs > BACKLOG_CLAIM_LEASE_MS;
+      lastKeeperPassMs = nowMs;
       const live: string[] = [];
       for (const { claim_thread_id: threadId } of claimed) {
         if (threadId === null) continue;
         const shell = yield* threads
           .getThreadShell(threadId as ThreadId)
           .pipe(Effect.orElseSucceed(() => null));
-        if (shell !== null && isThreadHoldingClaims(shell, nowMs)) live.push(threadId);
+        if (shell !== null ? isThreadHoldingClaims(shell, nowMs) : catchingUp) {
+          // A thread this machine does not know is held on another machine.
+          live.push(threadId);
+        }
       }
       yield* mutate((touched) =>
         Effect.gen(function* () {
@@ -1497,6 +1790,9 @@ export const layer = Layer.effect(
       addLink,
       linkPullRequestToClaims,
       subscribe,
+      exportBacklog,
+      importBacklog,
+      restoreBacklog,
     });
   }),
 );

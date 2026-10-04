@@ -14,6 +14,9 @@ import type { Project } from "../../types";
 import {
   EMPTY_BACKLOG_FILTERS,
   backlogChildProgress,
+  backlogOfflineNotice,
+  boardHomeTargets,
+  isBacklogRefWritable,
   backlogEntryForProject,
   backlogMoveTargets,
   backlogScopeKey,
@@ -664,5 +667,90 @@ describe("backlogMoveTargets", () => {
       creatableProjectIds: creatable,
     });
     expect(targets.map((target) => target.label)).toEqual(["API"]);
+  });
+});
+
+describe("offline boards", () => {
+  it("shows a saved copy read-only: offline while unreachable, quietly while it reconnects", () => {
+    const cached = { hasBoard: true, failed: false, fromCache: true } as const;
+    expect(resolveBacklogSourceStatus({ ...cached, connectionPhase: "offline" })).toBe("stale");
+    expect(resolveBacklogSourceStatus({ ...cached, connectionPhase: "connecting" })).toBe(
+      "loading",
+    );
+    expect(resolveBacklogSourceStatus({ ...cached, connectionPhase: "connected" })).toBe("loading");
+    expect(
+      resolveBacklogSourceStatus({ ...cached, connectionPhase: "connected", fromCache: false }),
+    ).toBe("live");
+  });
+
+  it("says whose board it is and how old", () => {
+    const stale = source({
+      environmentId: geekom,
+      status: "stale",
+      board: { ...board([], []), asOf: "2026-10-04T09:30:00.000Z" },
+    });
+    expect(backlogOfflineNotice(stale, () => "9:30 AM")).toBe(
+      "Offline — showing Geekom's board as of 9:30 AM; changes are disabled.",
+    );
+  });
+});
+
+describe("moving a board's home", () => {
+  const moved = {
+    ...wineBacklog,
+    movedTo: { environmentId: geekom, label: "Geekom", movedAt: "2026-10-04T10:00:00.000Z" },
+  };
+
+  it("offers connected machines without a board for the repository", () => {
+    const ex = EnvironmentId.make("env-ex");
+    const sources = [
+      source({ environmentId: mac, board: board([backlog(), wineBacklog], []) }),
+      source({ environmentId: geekom }),
+      source({ environmentId: ex, label: "EX", status: "stale" }),
+    ];
+    const ref = { environmentId: mac, backlog: wineBacklog };
+    expect(boardHomeTargets(ref, sources).map((target) => target.label)).toEqual(["Geekom"]);
+    expect(boardHomeTargets({ environmentId: mac, backlog: backlog() }, sources)).toEqual([]);
+    const taken = [
+      ...sources.slice(0, 1),
+      source({
+        environmentId: geekom,
+        board: board([{ ...wineBacklog, id: BacklogId.make("other") }], []),
+      }),
+    ];
+    expect(boardHomeTargets(ref, taken)).toEqual([]);
+  });
+
+  it("hides the redirect once the board itself is visible, and keeps it read-only otherwise", () => {
+    const wineIssue = issue({ id: "issue-wine", backlogId: wineBacklog.id });
+    const both = [
+      source({ environmentId: mac, board: board([backlog(), moved], [wineIssue]) }),
+      source({
+        environmentId: geekom,
+        board: board([backlog({ id: BacklogId.make("inbox-geekom") }), wineBacklog], [wineIssue]),
+      }),
+    ];
+    const entries = buildBacklogSwitcher({
+      sources: both,
+      projects: [project()],
+      groupingSettings,
+      primaryEnvironmentId: mac,
+    });
+    const wine = entries.find((entry) => entry.label === "Cork & Note")!;
+    expect(wine.backlogs.map((ref) => ref.environmentId)).toEqual([geekom]);
+    expect(wine.createTarget).toEqual({ environmentId: geekom, backlogId: wineBacklog.id });
+
+    const onlyRedirect = buildBacklogSwitcher({
+      sources: [both[0]!],
+      projects: [project()],
+      groupingSettings,
+      primaryEnvironmentId: mac,
+    }).find((entry) => entry.label === "Cork & Note")!;
+    expect(onlyRedirect.backlogs.map((ref) => ref.environmentId)).toEqual([mac]);
+    expect(onlyRedirect.createTarget).toBeNull();
+    expect(onlyRedirect.createBlockedReason).toBe(
+      "This board moved to Geekom, which is not connected.",
+    );
+    expect(isBacklogRefWritable(onlyRedirect.backlogs[0]!, new Map([[mac, both[0]!]]))).toBe(false);
   });
 });

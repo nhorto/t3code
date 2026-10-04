@@ -38,12 +38,13 @@ import * as Stream from "effect/Stream";
 import { projectFaviconCache } from "../assets/projectFaviconCache";
 
 const DATABASE_NAME = "t3code:connection-runtime";
-const DATABASE_VERSION = 4;
+const DATABASE_VERSION = 5;
 const CATALOG_STORE_NAME = "catalog";
 const SHELL_STORE_NAME = "shell";
 const THREAD_STORE_NAME = "thread";
 const SERVER_CONFIG_STORE_NAME = "server-config";
 const VCS_REFS_STORE_NAME = "vcs-refs";
+const BACKLOG_BOARD_STORE_NAME = "backlog-board";
 const CATALOG_KEY = "document";
 const StoredShellSnapshot = StoredOrchestrationShellSnapshot;
 const StoredShellSnapshotJson = Schema.fromJsonString(StoredShellSnapshot);
@@ -62,6 +63,9 @@ const StoredVcsRefs = Schema.Struct({
   refs: VcsListRefsResult,
 });
 const StoredVcsRefsJson = Schema.fromJsonString(StoredVcsRefs);
+const StoredBacklogBoardJson = Schema.fromJsonString(Persistence.StoredBacklogBoard);
+const decodeStoredBacklogBoard = Schema.decodeUnknownEffect(StoredBacklogBoardJson);
+const encodeStoredBacklogBoard = Schema.encodeEffect(StoredBacklogBoardJson);
 const ConnectionCatalogDocumentJson = Schema.fromJsonString(ConnectionCatalogDocument);
 const decodeConnectionCatalogDocument = Schema.decodeUnknownEffect(ConnectionCatalogDocumentJson);
 const encodeConnectionCatalogDocument = Schema.encodeEffect(ConnectionCatalogDocumentJson);
@@ -99,7 +103,9 @@ function persistenceError(
     | "save-vcs-refs"
     | "remove-vcs-refs"
     | "clear-vcs-refs"
-    | "clear-environment",
+    | "clear-environment"
+    | "load-backlog-board"
+    | "save-backlog-board",
   cause: unknown,
 ) {
   return new Persistence.ConnectionPersistenceError({
@@ -132,6 +138,9 @@ const openDatabase = Effect.fn("web.connectionStorage.openDatabase")(function* (
       }
       if (!request.result.objectStoreNames.contains(VCS_REFS_STORE_NAME)) {
         request.result.createObjectStore(VCS_REFS_STORE_NAME);
+      }
+      if (!request.result.objectStoreNames.contains(BACKLOG_BOARD_STORE_NAME)) {
+        request.result.createObjectStore(BACKLOG_BOARD_STORE_NAME);
       }
     });
     request.addEventListener("error", () => {
@@ -754,10 +763,40 @@ export const connectionStorageLayer = Layer.effectContext(
               VCS_REFS_STORE_NAME,
               IDBKeyRange.bound(`${environmentId}:`, `${environmentId}:\uffff`),
             ),
+            removeDatabaseValue(database, BACKLOG_BOARD_STORE_NAME, environmentId),
           ],
           { concurrency: "unbounded", discard: true },
         ).pipe(Effect.mapError((cause) => persistenceError("clear-environment", cause))),
     });
+
+    const backlogBoardStore: Persistence.BacklogBoardCacheStoreShape = {
+      load: (environmentId) =>
+        readDatabaseValue(database, BACKLOG_BOARD_STORE_NAME, environmentId).pipe(
+          Effect.flatMap((raw) =>
+            typeof raw !== "string"
+              ? Effect.succeedNone
+              : decodeStoredBacklogBoard(raw).pipe(
+                  Effect.map((stored) =>
+                    stored.environmentId === environmentId ? Option.some(stored) : Option.none(),
+                  ),
+                  // A copy from an older build is only a cache: drop it.
+                  Effect.catch(() =>
+                    removeDatabaseValue(database, BACKLOG_BOARD_STORE_NAME, environmentId).pipe(
+                      Effect.as(Option.none<Persistence.StoredBacklogBoard>()),
+                    ),
+                  ),
+                ),
+          ),
+          Effect.mapError((cause) => persistenceError("load-backlog-board", cause)),
+        ),
+      save: (board) =>
+        encodeStoredBacklogBoard(board).pipe(
+          Effect.flatMap((encoded) =>
+            writeDatabaseValue(database, BACKLOG_BOARD_STORE_NAME, board.environmentId, encoded),
+          ),
+          Effect.mapError((cause) => persistenceError("save-backlog-board", cause)),
+        ),
+    };
 
     return Context.make(Persistence.ConnectionTargetStore, targetStore).pipe(
       Context.add(GitHubRoutingPermissions, githubRoutingPermissions),
@@ -766,6 +805,7 @@ export const connectionStorageLayer = Layer.effectContext(
       Context.add(CredentialStore.ConnectionCredentialStore, credentialStore),
       Context.add(TokenStore.RemoteDpopAccessTokenStore, remoteTokenStore),
       Context.add(Persistence.EnvironmentCacheStore, cacheStore),
+      Context.add(Persistence.BacklogBoardCacheStore, backlogBoardStore),
     );
   }),
 );

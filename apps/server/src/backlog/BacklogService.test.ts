@@ -5,16 +5,20 @@ import {
   ProjectId,
   ThreadId,
   type BacklogActor,
+  type BacklogError,
   type BacklogStreamEvent,
   type OrchestrationProjectShell,
   type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
+import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -41,6 +45,18 @@ const projects: Record<string, { title: string; canonicalKey?: string }> = {
   [corkAndNoteClone]: { title: "Cork and Note", canonicalKey: "github.com/nhorto/cork-and-note" },
 };
 
+function projectShell(projectId: ProjectId) {
+  const project = projects[projectId];
+  return project === undefined
+    ? Option.none()
+    : Option.some({
+        id: projectId,
+        title: project.title,
+        repositoryIdentity:
+          project.canonicalKey === undefined ? null : { canonicalKey: project.canonicalKey },
+      } as unknown as OrchestrationProjectShell);
+}
+
 /** Threads whose run is still active, so the lease keeper renews their claims. */
 const runningThreads = new Set<string>([agent("live").threadId!]);
 /** Threads with no run, each with when it was last active (the test clock starts at 0). */
@@ -51,21 +67,11 @@ const testLayer = layer.pipe(
     Layer.mergeAll(
       NodeCrypto.layer,
       Layer.mock(ProjectService.ProjectService)({
-        getShell: (projectId) => {
-          const project = projects[projectId];
-          return Effect.succeed(
-            project === undefined
-              ? Option.none()
-              : Option.some({
-                  id: projectId,
-                  title: project.title,
-                  repositoryIdentity:
-                    project.canonicalKey === undefined
-                      ? null
-                      : { canonicalKey: project.canonicalKey },
-                } as unknown as OrchestrationProjectShell),
-          );
-        },
+        getShell: (projectId) => Effect.succeed(projectShell(projectId)),
+        listShells: () =>
+          Effect.succeed(
+            Object.keys(projects).flatMap((id) => Option.toArray(projectShell(ProjectId.make(id)))),
+          ),
       }),
       Layer.mock(ThreadManagementService.ThreadManagementService)({
         getThreadShell: (threadId) =>
@@ -647,4 +653,164 @@ it.effect("streams a snapshot, then a delta for every changed row", () =>
       assert.equal(first.key, "CN-1");
     }),
   ),
+);
+
+/** Two machines' backlog services, each with its own database. */
+const twoMachines = Effect.gen(function* () {
+  const start = () =>
+    Layer.build(testLayer.pipe(Layer.provide(SqlitePersistenceMemory))).pipe(
+      Effect.map((context) => Context.get(context, BacklogService)),
+    );
+  return { laptop: yield* start(), geekom: yield* start() };
+});
+const toGeekom = { environmentId: EnvironmentId.make("environment-geekom"), label: "Geekom" };
+
+it.effect("moves a board to another machine with its ids, numbers, edges and history", () =>
+  Effect.gen(function* () {
+    const { laptop, geekom } = yield* twoMachines;
+    const spec = yield* laptop.createIssue(
+      { projectId: corkAndNote, title: "Spec", body: "The plan", status: "ready" },
+      user,
+    );
+    const [first, second] = yield* laptop.createChildren(
+      {
+        parentId: spec.id,
+        children: [{ title: "First" }, { title: "Second", blockedBySiblings: [0] }],
+      },
+      user,
+    );
+    yield* laptop.comment({ issueId: first!.id, text: "Started thinking" }, user);
+    const before = yield* laptop.getIssue({ issueId: second!.id });
+
+    const exported = yield* laptop.exportBacklog({ backlogId: spec.backlogId, to: toGeekom });
+    const imported = yield* geekom.importBacklog(exported);
+    assert.equal(imported.id, spec.backlogId);
+    assert.equal(imported.key, "CN");
+    assert.isUndefined(imported.movedTo);
+
+    const after = yield* geekom.getIssue({ issueId: second!.id });
+    assert.deepEqual(after.issue, before.issue);
+    assert.deepEqual(after.activity, before.activity);
+    assert.equal(after.parent?.body, "The plan");
+    assert.deepEqual(
+      (yield* geekom.getIssue({ issueId: first!.id })).activity.map((entry) => entry.text),
+      [null, "Started thinking"],
+    );
+    // Numbering carries on where it left off.
+    const next = yield* geekom.createIssue({ backlogId: imported.id, title: "Third" }, user);
+    assert.equal(next.key, "CN-4");
+  }).pipe(Effect.scoped),
+);
+
+it.effect("leaves a read-only redirect behind that names where the board went", () =>
+  Effect.gen(function* () {
+    const { laptop, geekom } = yield* twoMachines;
+    const issue = yield* laptop.createIssue(
+      { projectId: corkAndNote, title: "Paywall", status: "ready" },
+      user,
+    );
+    yield* geekom.importBacklog(
+      yield* laptop.exportBacklog({ backlogId: issue.backlogId, to: toGeekom }),
+    );
+
+    const [, redirect] = yield* laptop.listBacklogs();
+    assert.equal(redirect?.movedTo?.label, "Geekom");
+    // Clients still read the old copy; agents and every change are turned away.
+    assert.equal((yield* laptop.getIssue({ issueId: issue.id })).issue.title, "Paywall");
+    const attempts: ReadonlyArray<Effect.Effect<void, BacklogError>> = [
+      laptop.updateIssue({ issueId: issue.id, status: "done" }, user).pipe(Effect.asVoid),
+      laptop.claim({ issueId: issue.id }, agent("worker")).pipe(Effect.asVoid),
+      laptop.comment({ issueId: issue.id, text: "Hello?" }, user).pipe(Effect.asVoid),
+      laptop.createIssue({ projectId: corkAndNote, title: "New" }, user).pipe(Effect.asVoid),
+      laptop.resolveIssueRef("CN-1").pipe(Effect.asVoid),
+    ];
+    for (const attempt of attempts) {
+      const error = yield* Effect.flip(attempt);
+      assert.equal(error.code, "conflict");
+      assert.equal(error.movedTo?.environmentId, toGeekom.environmentId);
+      assert.include(error.message, "moved to Geekom");
+    }
+    assert.lengthOf(yield* laptop.listIssues({ frontierOnly: true }), 0);
+    assert.isNull(yield* laptop.claimNext({}, agent("worker")));
+  }).pipe(Effect.scoped),
+);
+
+it.effect("refuses to move a board while an issue is claimed, or onto a machine that has one", () =>
+  Effect.gen(function* () {
+    const { laptop, geekom } = yield* twoMachines;
+    const issue = yield* laptop.createIssue(
+      { projectId: corkAndNote, title: "Paywall", status: "ready" },
+      user,
+    );
+    yield* laptop.claim({ issueId: issue.id }, agent("worker"));
+    const claimed = yield* laptop
+      .exportBacklog({ backlogId: issue.backlogId, to: toGeekom })
+      .pipe(Effect.flip);
+    assert.equal(claimed.code, "conflict");
+    assert.include(claimed.message, "CN-1");
+    assert.isUndefined((yield* laptop.resolveBacklogRef("CN")).movedTo);
+
+    yield* laptop.release({ issueId: issue.id, status: "ready" }, user);
+    yield* geekom.createIssue({ projectId: corkAndNote, title: "Already here" }, user);
+    const exported = yield* laptop.exportBacklog({ backlogId: issue.backlogId, to: toGeekom });
+    const duplicate = yield* geekom.importBacklog(exported).pipe(Effect.flip);
+    assert.equal(duplicate.code, "conflict");
+    // The failed import is undone on the laptop, which then works as before.
+    const restored = yield* laptop.restoreBacklog(issue.backlogId);
+    assert.isUndefined(restored.movedTo);
+    yield* laptop.comment({ issueId: issue.id, text: "Back" }, user);
+  }).pipe(Effect.scoped),
+);
+
+it.effect("moves a board back, replacing the redirect it left", () =>
+  Effect.gen(function* () {
+    const { laptop, geekom } = yield* twoMachines;
+    const issue = yield* laptop.createIssue({ projectId: corkAndNote, title: "Paywall" }, user);
+    const toLaptop = { environmentId, label: "Laptop" };
+    yield* geekom.importBacklog(
+      yield* laptop.exportBacklog({ backlogId: issue.backlogId, to: toGeekom }),
+    );
+    yield* geekom.comment({ issueId: issue.id, text: "Worked on the Geekom" }, user);
+    const back = yield* laptop.importBacklog(
+      yield* geekom.exportBacklog({ backlogId: issue.backlogId, to: toLaptop }),
+    );
+    assert.isUndefined(back.movedTo);
+    const detail = yield* laptop.getIssue({ issueId: issue.id });
+    assert.equal(detail.activity.at(-1)?.text, "Worked on the Geekom");
+    assert.equal(
+      (yield* geekom.resolveBacklogRef(issue.backlogId).pipe(Effect.flip)).code,
+      "conflict",
+    );
+  }).pipe(Effect.scoped),
+);
+
+it.effect("gives claims held on other machines one lease to renew after the hub restarts", () =>
+  Effect.gen(function* () {
+    const sql = yield* Layer.build(SqlitePersistenceMemory);
+    const start = () =>
+      Layer.build(testLayer.pipe(Layer.provide(Layer.succeedContext(sql)))).pipe(
+        Effect.map((context) => Context.get(context, BacklogService)),
+      );
+    const remote: BacklogActor = {
+      kind: "agent",
+      environmentId: EnvironmentId.make("environment-spoke"),
+      threadId: ThreadId.make("thread-on-the-spoke"),
+      label: "Spoke agent",
+    };
+    const firstRun = yield* Scope.make();
+    const before = yield* start().pipe(Scope.provide(firstRun));
+    const issue = yield* before.createIssue({ title: "Remote work", status: "ready" }, user);
+    yield* before.claim({ issueId: issue.id }, remote);
+    yield* Scope.close(firstRun, Exit.void);
+
+    // Down for longer than a lease: the spoke could not renew meanwhile.
+    yield* TestClock.adjust("30 minutes");
+    const after = yield* start();
+    yield* TestClock.adjust("1 minute");
+    assert.equal((yield* after.getIssue({ issueId: issue.id })).issue.status, "in_progress");
+
+    // A spoke that never renews loses it one lease later.
+    yield* TestClock.adjust("16 minutes");
+    assert.isNull((yield* after.getIssue({ issueId: issue.id })).issue.claim);
+  }).pipe(Effect.scoped),
 );

@@ -5,6 +5,11 @@
  * hub when linked, since it is the fleet's default host; a project's existing
  * backlog here stays here. Everything one call touches must live on one home.
  *
+ * While the hub is unreachable, reads answer from the last snapshot of it
+ * (BacklogHubSnapshot) and say so with `stale: true` and `asOf`; writes fail
+ * with code unavailable. A backlog that moved away from this machine answers
+ * with where it went, or is followed to the hub when it moved there.
+ *
  * Clients do not route: they connect to every environment directly.
  */
 import {
@@ -23,6 +28,8 @@ import {
   type BacklogListIssuesInput,
   type BacklogReleaseStatus,
   type BacklogRepositoryTarget,
+  type EnvironmentId,
+  parseBacklogIssueKey,
   type ProjectId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -33,6 +40,7 @@ import * as Option from "effect/Option";
 import * as ProjectService from "../project/ProjectService.ts";
 import { localBacklogHome, type BacklogHome } from "./BacklogHome.ts";
 import * as BacklogHubClient from "./BacklogHubClient.ts";
+import * as BacklogHubSnapshot from "./BacklogHubSnapshot.ts";
 import * as BacklogService from "./BacklogService.ts";
 
 /** Where a backlog or issue lives, from this environment's point of view. */
@@ -43,6 +51,19 @@ export interface BacklogHubNote {
   readonly label: string;
   readonly state: "connected" | "unavailable";
   readonly message: string | null;
+}
+
+/** Which machine an issue answer came from. */
+export interface BacklogHostFields {
+  readonly host: BacklogHost;
+  /** The hub's label, or "this machine". */
+  readonly machine: string;
+}
+
+/** Present when part of an answer came from the hub's last snapshot instead of the hub. */
+export interface BacklogStaleFields {
+  readonly stale?: true;
+  readonly asOf?: string;
 }
 
 export interface RoutedCreateIssueInput {
@@ -97,17 +118,19 @@ export class BacklogRouter extends Context.Service<
       {
         readonly backlogs: ReadonlyArray<Backlog & { readonly host: BacklogHost }>;
         readonly hub: BacklogHubNote | null;
-      },
+      } & BacklogStaleFields,
       BacklogError
     >;
     readonly listIssues: (input: RoutedListIssuesInput) => Effect.Effect<
       {
         readonly issues: ReadonlyArray<BacklogIssue & { readonly host: BacklogHost }>;
         readonly hub: BacklogHubNote | null;
-      },
+      } & BacklogStaleFields,
       BacklogError
     >;
-    readonly getIssue: (ref: string) => Effect.Effect<BacklogIssueDetail, BacklogError>;
+    readonly getIssue: (
+      ref: string,
+    ) => Effect.Effect<BacklogIssueDetail & BacklogHostFields & BacklogStaleFields, BacklogError>;
     readonly createIssue: (
       input: RoutedCreateIssueInput,
       actor: BacklogActor,
@@ -123,11 +146,11 @@ export class BacklogRouter extends Context.Service<
     readonly claim: (
       ref: string,
       actor: BacklogActor,
-    ) => Effect.Effect<BacklogClaimResult, BacklogError>;
+    ) => Effect.Effect<BacklogClaimResult & BacklogHostFields, BacklogError>;
     readonly claimNext: (
       input: RoutedClaimNextInput,
       actor: BacklogActor,
-    ) => Effect.Effect<BacklogClaimResult | null, BacklogError>;
+    ) => Effect.Effect<(BacklogClaimResult & BacklogHostFields) | null, BacklogError>;
     readonly release: (
       input: {
         readonly issue: string;
@@ -152,6 +175,8 @@ interface Target {
   readonly host: BacklogHost;
   readonly home: BacklogHome;
   readonly label: string;
+  /** The hub's environment; null for this machine. */
+  readonly environmentId: EnvironmentId | null;
 }
 
 /** Where a project's issues go: an existing backlog, or one to create on first use. */
@@ -161,6 +186,7 @@ type ProjectPlacement =
   | { readonly target: Target; readonly projectId: ProjectId };
 
 const isNotFound = (error: BacklogError) => error.code === "not_found";
+const isMoved = (error: BacklogError) => error.movedTo !== undefined;
 const notFound = (message: string) => new BacklogError({ code: "not_found", message });
 const invalid = (message: string) => new BacklogError({ code: "invalid", message });
 
@@ -188,19 +214,81 @@ export const make = Effect.gen(function* () {
   const service = yield* BacklogService.BacklogService;
   const hubClient = yield* BacklogHubClient.BacklogHubClient;
   const projects = yield* ProjectService.ProjectService;
+  const snapshot = yield* BacklogHubSnapshot.BacklogHubSnapshot;
 
-  const local: Target = { host: "local", home: localBacklogHome(service), label: "this machine" };
+  const local: Target = {
+    host: "local",
+    home: localBacklogHome(service),
+    label: "this machine",
+    environmentId: null,
+  };
   const hub = hubClient.linkedHub.pipe(
     Effect.map(
-      Option.map((linked): Target => ({ host: "hub", home: hubClient.home, label: linked.label })),
+      Option.map((linked): Target => ({
+        host: "hub",
+        home: snapshot.wrap(linked.environmentId, hubClient.home),
+        label: linked.label,
+        environmentId: linked.environmentId,
+      })),
     ),
   );
+  /** The hub, when a backlog that moved away from here went to it. */
+  const hubHolding = (backlog: Pick<Backlog, "movedTo">) =>
+    hub.pipe(
+      Effect.map(
+        Option.filter(
+          (target) =>
+            backlog.movedTo !== undefined && target.environmentId === backlog.movedTo.environmentId,
+        ),
+      ),
+    );
+  /** Follows a moved backlog's redirect to the hub, or reports where it went. */
+  const followMove = <A>(
+    error: BacklogError,
+    onHub: (target: Target) => Effect.Effect<A, BacklogError>,
+  ) =>
+    hubHolding({ movedTo: error.movedTo }).pipe(
+      Effect.flatMap(
+        Option.match({ onNone: () => Effect.fail(error), onSome: (target) => onHub(target) }),
+      ),
+    );
   /** Where new backlogs and Inbox ideas go: the hub when linked. */
   const defaultTarget = hub.pipe(Effect.map(Option.getOrElse(() => local)));
 
-  /** Local first, then the hub. */
+  const hostOf = (target: Target): BacklogHostFields => ({
+    host: target.host,
+    machine: target.label,
+  });
+
+  /**
+   * A key that names something here and something else on the hub is
+   * ambiguous (both machines have an INBOX, and keys are chosen per machine).
+   * Ids are global, so they never are.
+   */
+  const unlessAlsoOnHub = (
+    ref: string,
+    localId: string,
+    onHub: (target: Target) => Effect.Effect<string, BacklogError>,
+  ) =>
+    Effect.gen(function* () {
+      const linked = yield* hub;
+      if (Option.isNone(linked)) return;
+      const there = yield* Effect.result(onHub(linked.value));
+      if (there._tag === "Success" && there.success !== localId) {
+        return yield* invalid(
+          `${ref.trim()} is ambiguous: it names ${localId} on this machine and ${there.success} on ${linked.value.label}. Pass the id instead.`,
+        );
+      }
+    });
+
+  /** Local first, then the hub. A key found on both is ambiguous. */
   const resolveIssue = (ref: string) =>
     local.home.resolveIssue(ref).pipe(
+      Effect.tap((id) =>
+        parseBacklogIssueKey(ref) === null
+          ? Effect.void
+          : unlessAlsoOnHub(ref, id, (target) => target.home.resolveIssue(ref)),
+      ),
       Effect.map((id) => ({ target: local, id })),
       Effect.catchIf(isNotFound, (localMiss) =>
         Effect.gen(function* () {
@@ -218,6 +306,11 @@ export const make = Effect.gen(function* () {
           );
           return { target, id };
         }),
+      ),
+      Effect.catchIf(isMoved, (moved) =>
+        followMove(moved, (target) =>
+          target.home.resolveIssue(ref).pipe(Effect.map((id) => ({ target, id }))),
+        ),
       ),
     );
 
@@ -237,6 +330,20 @@ export const make = Effect.gen(function* () {
 
   const resolveBacklog = (ref: string) =>
     service.resolveBacklogRef(ref).pipe(
+      Effect.tap((backlog) =>
+        backlog.id === ref.trim()
+          ? Effect.void
+          : unlessAlsoOnHub(ref, backlog.id, (target) =>
+              target.home.listBacklogs().pipe(
+                Effect.flatMap((backlogs) => {
+                  const found = backlogs.find((candidate) => backlogMatches(candidate, ref));
+                  return found === undefined
+                    ? Effect.fail(notFound(`Backlog ${ref} is not on ${target.label}.`))
+                    : Effect.succeed(found.id as string);
+                }),
+              ),
+            ),
+      ),
       Effect.map((backlog) => ({ target: local, backlogId: backlog.id })),
       Effect.catchIf(isNotFound, (localMiss) =>
         Effect.gen(function* () {
@@ -252,6 +359,18 @@ export const make = Effect.gen(function* () {
           }
           return { target: linked.value, backlogId: found.id };
         }),
+      ),
+      Effect.catchIf(isMoved, (moved) =>
+        followMove(moved, (target) =>
+          target.home.listBacklogs().pipe(
+            Effect.flatMap((backlogs) => {
+              const found = backlogs.find((backlog) => backlogMatches(backlog, ref));
+              return found === undefined
+                ? Effect.fail(moved)
+                : Effect.succeed({ target, backlogId: found.id });
+            }),
+          ),
+        ),
       ),
     );
 
@@ -270,7 +389,8 @@ export const make = Effect.gen(function* () {
           backlog.projectId === projectId ||
           (repositoryKey !== null && backlog.repositoryKey === repositoryKey),
       );
-      if (own !== undefined)
+      // A backlog moved to the hub is placed there below, by repository.
+      if (own !== undefined && Option.isNone(yield* hubHolding(own)))
         return Option.some<ProjectPlacement>({ target: local, backlogId: own.id });
       const linked = yield* hub;
       if (Option.isSome(linked) && repositoryKey !== null) {
@@ -326,58 +446,92 @@ export const make = Effect.gen(function* () {
   const noteFor = (target: Target): BacklogHubNote | null =>
     target.host === "hub" ? { label: target.label, state: "connected", message: null } : null;
 
+  /** Marks an answer that used the hub's snapshot, and its hub note with it. */
+  const tracked = <A extends object>(effect: Effect.Effect<A, BacklogError>) =>
+    snapshot.track(effect).pipe(
+      Effect.map(({ value, stale }): A & BacklogStaleFields => {
+        if (stale === null) return value;
+        const note: BacklogHubNote | null | undefined =
+          "hub" in value ? (value.hub as BacklogHubNote | null) : undefined;
+        return {
+          ...value,
+          ...(note === undefined || note === null
+            ? {}
+            : {
+                hub: {
+                  label: note.label,
+                  state: "unavailable",
+                  message: `${note.label} is unreachable; its rows are what it last reported, as of ${stale.asOf}. Changes to them fail until it is back.`,
+                } satisfies BacklogHubNote,
+              }),
+          stale: true,
+          asOf: stale.asOf,
+        };
+      }),
+    );
+
   const listBacklogs: BacklogRouter["Service"]["listBacklogs"] = () =>
-    Effect.gen(function* () {
-      const own = yield* service.listBacklogs();
-      const remote = yield* listOnHub((target) => target.home.listBacklogs());
-      return {
-        backlogs: [...withHost("local")(own), ...withHost("hub")(remote.rows)],
-        hub: remote.note,
-      };
-    });
+    tracked(
+      Effect.gen(function* () {
+        const own = yield* service.listBacklogs();
+        const remote = yield* listOnHub((target) => target.home.listBacklogs());
+        return {
+          backlogs: [...withHost("local")(own), ...withHost("hub")(remote.rows)],
+          hub: remote.note,
+        };
+      }),
+    );
 
   const listIssues: BacklogRouter["Service"]["listIssues"] = (input) =>
-    Effect.gen(function* () {
-      const filters: BacklogListIssuesInput = {
-        status: input.status,
-        type: input.type,
-        frontierOnly: input.frontierOnly,
-      };
-      const scoped = (target: Target, backlogId: BacklogId | undefined) =>
-        Effect.gen(function* () {
-          const parentId =
-            input.parent === undefined
-              ? undefined
-              : (yield* resolveIssueIn(target, [input.parent]))[0];
-          const issues = yield* target.home.listIssues({ ...filters, backlogId, parentId });
-          return { issues: withHost(target.host)(issues), hub: noteFor(target) };
-        });
-      if (input.backlog !== undefined) {
-        const { target, backlogId } = yield* resolveBacklog(input.backlog);
-        return yield* scoped(target, backlogId);
-      }
-      if (input.projectId !== undefined) {
-        const placement = yield* placeProject(input.projectId, "find");
-        if (Option.isNone(placement) || !("backlogId" in placement.value)) {
-          return { issues: [], hub: null };
+    tracked(
+      Effect.gen(function* () {
+        const filters: BacklogListIssuesInput = {
+          status: input.status,
+          type: input.type,
+          frontierOnly: input.frontierOnly,
+        };
+        const scoped = (target: Target, backlogId: BacklogId | undefined) =>
+          Effect.gen(function* () {
+            const parentId =
+              input.parent === undefined
+                ? undefined
+                : (yield* resolveIssueIn(target, [input.parent]))[0];
+            const issues = yield* target.home.listIssues({ ...filters, backlogId, parentId });
+            return { issues: withHost(target.host)(issues), hub: noteFor(target) };
+          });
+        if (input.backlog !== undefined) {
+          const { target, backlogId } = yield* resolveBacklog(input.backlog);
+          return yield* scoped(target, backlogId);
         }
-        return yield* scoped(placement.value.target, placement.value.backlogId);
-      }
-      if (input.parent !== undefined) {
-        const { target } = yield* resolveIssue(input.parent);
-        return yield* scoped(target, undefined);
-      }
-      const own = yield* local.home.listIssues(filters);
-      const remote = yield* listOnHub((target) => target.home.listIssues(filters));
-      return {
-        issues: [...withHost("local")(own), ...withHost("hub")(remote.rows)],
-        hub: remote.note,
-      };
-    });
+        if (input.projectId !== undefined) {
+          const placement = yield* placeProject(input.projectId, "find");
+          if (Option.isNone(placement) || !("backlogId" in placement.value)) {
+            return { issues: [], hub: null };
+          }
+          return yield* scoped(placement.value.target, placement.value.backlogId);
+        }
+        if (input.parent !== undefined) {
+          const { target } = yield* resolveIssue(input.parent);
+          return yield* scoped(target, undefined);
+        }
+        const own = yield* local.home.listIssues(filters);
+        const remote = yield* listOnHub((target) => target.home.listIssues(filters));
+        return {
+          issues: [...withHost("local")(own), ...withHost("hub")(remote.rows)],
+          hub: remote.note,
+        };
+      }),
+    );
 
   const getIssue: BacklogRouter["Service"]["getIssue"] = (ref) =>
-    resolveIssue(ref).pipe(
-      Effect.flatMap(({ target, id }) => target.home.getIssue({ issueId: id })),
+    tracked(
+      resolveIssue(ref).pipe(
+        Effect.flatMap(({ target, id }) =>
+          target.home
+            .getIssue({ issueId: id })
+            .pipe(Effect.map((detail) => ({ ...detail, ...hostOf(target) }))),
+        ),
+      ),
     );
 
   const createIssue: BacklogRouter["Service"]["createIssue"] = (
@@ -475,7 +629,11 @@ export const make = Effect.gen(function* () {
 
   const claim: BacklogRouter["Service"]["claim"] = (ref, actor) =>
     resolveIssue(ref).pipe(
-      Effect.flatMap(({ target, id }) => target.home.claim({ issueId: id }, actor)),
+      Effect.flatMap(({ target, id }) =>
+        target.home
+          .claim({ issueId: id }, actor)
+          .pipe(Effect.map((claimed) => ({ ...claimed, ...hostOf(target) }))),
+      ),
     );
 
   const claimNext: BacklogRouter["Service"]["claimNext"] = (input, actor) =>
@@ -486,7 +644,11 @@ export const make = Effect.gen(function* () {
             input.parent === undefined
               ? undefined
               : (yield* resolveIssueIn(target, [input.parent]))[0];
-          return yield* target.home.claimNext({ backlogId, parentId, type: input.type }, actor);
+          const claimed = yield* target.home.claimNext(
+            { backlogId, parentId, type: input.type },
+            actor,
+          );
+          return claimed === null ? null : { ...claimed, ...hostOf(target) };
         });
       if (input.backlog !== undefined) {
         const { target, backlogId } = yield* resolveBacklog(input.backlog);
@@ -554,4 +716,5 @@ export const layer = Layer.effect(BacklogRouter, make);
 /** The router with the hub link and its lease renewal, for the server runtime. */
 export const fleetLayer = Layer.mergeAll(layer, BacklogHubClient.renewalLayer).pipe(
   Layer.provideMerge(BacklogHubClient.layer),
+  Layer.provideMerge(BacklogHubSnapshot.layer),
 );

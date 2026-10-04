@@ -1,9 +1,18 @@
-import { BacklogId, BacklogIssueId, type Backlog, type BacklogIssue } from "@t3tools/contracts";
+import {
+  BacklogId,
+  BacklogIssueId,
+  EnvironmentId,
+  type Backlog,
+  type BacklogIssue,
+} from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  BACKLOG_CACHE_MAX_ISSUES,
   EMPTY_BACKLOG_BOARD,
+  backlogBoardForCache,
+  backlogBoardFromCache,
   claimTakeoverMessage,
   foldBacklogStreamEvent,
   groupBacklogIssuesByStatus,
@@ -174,5 +183,56 @@ describe("claims", () => {
         }),
       ),
     ).toBe("This takes WINE-12 away from Claude. Continue?");
+  });
+});
+
+describe("the offline copy of a board", () => {
+  const geekom = EnvironmentId.make("environment-geekom");
+  const nowMs = Date.parse("2026-10-04T12:00:00.000Z");
+
+  it("keeps open work and recent history, but not issues closed over 30 days ago", () => {
+    const board = foldBacklogStreamEvent(EMPTY_BACKLOG_BOARD, {
+      type: "snapshot",
+      backlogs: [backlog],
+      issues: [
+        issue("open"),
+        issue("closed-last-week", { status: "done", closedAt: "2026-09-27T12:00:00.000Z" }),
+        issue("closed-in-july", { status: "wontfix", closedAt: "2026-07-01T12:00:00.000Z" }),
+      ],
+    });
+    const stored = backlogBoardForCache(
+      geekom,
+      { ...board, asOf: "2026-10-04T11:59:00.000Z" },
+      nowMs,
+    );
+    expect(stored.issues.map((entry) => entry.id)).toEqual(["open", "closed-last-week"]);
+    expect(stored.backlogs).toEqual([backlog]);
+    expect(stored.asOf).toBe("2026-10-04T11:59:00.000Z");
+
+    const restored = backlogBoardFromCache(stored);
+    expect(restored.fromCache).toBe(true);
+    expect(restored.asOf).toBe(stored.asOf);
+    expect(restored.issuesById.get(BacklogIssueId.make("open"))?.title).toBe(
+      "Paywall crashes on iPad",
+    );
+  });
+
+  it("caps the copy at the most recently updated issues", () => {
+    const issues = Array.from({ length: BACKLOG_CACHE_MAX_ISSUES + 5 }, (_, index) =>
+      issue(`issue-${index}`, {
+        updatedAt: `2026-01-01T${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}:00.000Z`,
+      }),
+    );
+    const board = foldBacklogStreamEvent(EMPTY_BACKLOG_BOARD, {
+      type: "snapshot",
+      backlogs: [backlog],
+      issues,
+    });
+    const stored = backlogBoardForCache(geekom, board, nowMs);
+    expect(stored.issues).toHaveLength(BACKLOG_CACHE_MAX_ISSUES);
+    expect(stored.issues.some((entry) => entry.id === "issue-0")).toBe(false);
+    expect(
+      stored.issues.some((entry) => entry.id === `issue-${BACKLOG_CACHE_MAX_ISSUES + 4}`),
+    ).toBe(true);
   });
 });

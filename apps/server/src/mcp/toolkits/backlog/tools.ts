@@ -9,6 +9,7 @@ import {
   BacklogIssueStatus,
   BacklogIssueType,
   BacklogReleaseStatus,
+  IsoDateTime,
   OrchestratorMcpFailure,
   ProjectId,
   TrimmedNonEmptyString,
@@ -23,10 +24,11 @@ import * as McpInvocationContext from "../../McpInvocationContext.ts";
 
 const IssueRef = TrimmedNonEmptyString.annotate({
   description:
-    "An issue id, or its key such as WINE-12 (case-insensitive). Issues on the linked backlog hub resolve too.",
+    "An issue id, or its key such as WINE-12 (case-insensitive). Issues on the linked backlog hub resolve too; a key that names an issue on both machines is ambiguous, so pass the id.",
 });
 const BacklogRef = TrimmedNonEmptyString.annotate({
-  description: "A backlog id, or its key such as WINE or INBOX (case-insensitive).",
+  description:
+    "A backlog id, or its key such as WINE or INBOX (case-insensitive). When this machine is linked to a hub, a key both machines use (every machine has an INBOX) is ambiguous; pass the id.",
 });
 const ProjectTarget = ProjectId.annotate({
   description:
@@ -61,6 +63,21 @@ const HubNote = Schema.NullOr(
     "The linked backlog hub, if any. unavailable means its rows are missing from this answer; retry later.",
 });
 
+/** Set when the backlog hub was unreachable and its part of the answer is its last snapshot. */
+/** Which machine answered an issue call. */
+const IssueHost = {
+  host: Host,
+  machine: Schema.String.annotate({ description: 'The hub\'s name, or "this machine".' }),
+};
+
+const Stale = {
+  stale: Schema.optional(Schema.Literal(true)).annotate({
+    description:
+      "true: the backlog hub was unreachable, so its rows are the last ones it reported, as of asOf. They may be out of date, and changes to them fail with code unavailable until it is back.",
+  }),
+  asOf: Schema.optional(IsoDateTime),
+};
+
 const BacklogGuideTool = Tool.make("backlog_guide", {
   ...shared,
   description:
@@ -75,10 +92,11 @@ const BacklogGuideTool = Tool.make("backlog_guide", {
 const ListBacklogsTool = Tool.make("backlog_list_backlogs", {
   ...shared,
   description:
-    "List the backlogs: this machine's Inbox and project backlogs, plus the backlog hub's when this machine is linked to one (host says which). Keys such as WINE prefix issue keys (WINE-12). Both machines have an INBOX; a key resolves on this machine first, so use the id for the hub's.",
+    "List the backlogs: this machine's Inbox and project backlogs, plus the backlog hub's when this machine is linked to one (host says which). Keys such as WINE prefix issue keys (WINE-12). Both machines have an INBOX: a key that exists on both is ambiguous, so pass the id. A backlog with movedTo lives on that machine now; its copy here is read-only.",
   success: Schema.Struct({
     backlogs: Schema.Array(Schema.Struct({ ...Backlog.fields, host: Host })),
     hub: HubNote,
+    ...Stale,
   }),
 })
   .annotate(Tool.Title, "List backlogs")
@@ -107,6 +125,7 @@ const ListIssuesTool = Tool.make("backlog_list_issues", {
     issues: Schema.Array(Schema.Struct({ ...BacklogIssue.fields, host: Host })),
     total: Schema.Int.annotate({ description: "Matching issues before the limit." }),
     hub: HubNote,
+    ...Stale,
   }),
 })
   .annotate(Tool.Title, "List backlog issues")
@@ -119,7 +138,7 @@ const GetIssueTool = Tool.make("backlog_get_issue", {
   description:
     "Read one issue with its markdown body, its parent's spec, its children, its blockers, and its full activity history.",
   parameters: Schema.Struct({ issue: IssueRef }),
-  success: BacklogIssueDetail,
+  success: Schema.Struct({ ...BacklogIssueDetail.fields, ...IssueHost, ...Stale }),
 })
   .annotate(Tool.Title, "Read a backlog issue")
   .annotate(Tool.Readonly, true)
@@ -201,7 +220,7 @@ const ClaimTool = Tool.make("backlog_claim", {
   description:
     "Claim an issue for this thread before working on it. Only frontier issues (ready, unblocked, unclaimed) can be claimed, and a claim is exclusive across every agent and machine; a conflict means someone else has it, so pick another. Claiming moves the issue to in_progress, links this thread, and returns the issue with its parent's spec. The claim is a lease: it holds while this thread is running or was active in the last 2 hours (so stopping to ask the user a question keeps it), and expires about 15 minutes after that. Re-claiming an issue this thread holds is safe and returns alreadyHeld: true. A claim belongs to a T3 thread, so workers sharing one thread (a provider's built-in subagents) cannot hold separate claims; if you get alreadyHeld: true without having claimed the issue yourself, another worker in this thread has it.",
   parameters: Schema.Struct({ issue: IssueRef }),
-  success: BacklogClaimResult,
+  success: Schema.Struct({ ...BacklogClaimResult.fields, ...IssueHost }),
 })
   .annotate(Tool.Title, "Claim a backlog issue")
   .annotate(Tool.Destructive, false)
@@ -217,7 +236,9 @@ const ClaimNextTool = Tool.make("backlog_claim_next", {
     parent: Schema.optional(IssueRef),
     type: Schema.optional(BacklogIssueType),
   }),
-  success: Schema.Struct({ claimed: Schema.NullOr(BacklogClaimResult) }),
+  success: Schema.Struct({
+    claimed: Schema.NullOr(Schema.Struct({ ...BacklogClaimResult.fields, ...IssueHost })),
+  }),
 })
   .annotate(Tool.Title, "Claim the next backlog issue")
   .annotate(Tool.Destructive, false);

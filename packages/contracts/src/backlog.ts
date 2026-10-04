@@ -57,6 +57,14 @@ export const BacklogActor = Schema.Struct({
 });
 export type BacklogActor = typeof BacklogActor.Type;
 
+/** Where a backlog went when its home moved to another environment. */
+export const BacklogMovedTo = Schema.Struct({
+  environmentId: EnvironmentId,
+  label: Schema.String,
+  movedAt: IsoDateTime,
+});
+export type BacklogMovedTo = typeof BacklogMovedTo.Type;
+
 export const Backlog = Schema.Struct({
   id: BacklogId,
   kind: Schema.Literals(["inbox", "project"]),
@@ -71,6 +79,11 @@ export const Backlog = Schema.Struct({
   repositoryKey: Schema.NullOr(TrimmedNonEmptyString),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
+  /**
+   * Set once the backlog moved to another environment. This copy stays as a
+   * read-only redirect; the board lives on there. Absent while it lives here.
+   */
+  movedTo: Schema.optional(BacklogMovedTo),
 });
 export type Backlog = typeof Backlog.Type;
 
@@ -193,6 +206,8 @@ export class BacklogError extends Schema.TaggedError<BacklogError>()("BacklogErr
   issueId: Schema.optional(BacklogIssueId),
   /** Set with code unavailable. */
   reason: Schema.optional(BacklogUnavailableReason),
+  /** Set with code conflict when the backlog moved to another environment. */
+  movedTo: Schema.optional(BacklogMovedTo),
   cause: Schema.optional(Schema.Defect()),
 }) {}
 
@@ -376,6 +391,40 @@ export const BacklogLinkPullRequestInput = Schema.Struct({
 });
 export type BacklogLinkPullRequestInput = typeof BacklogLinkPullRequestInput.Type;
 
+// Moving a backlog's home: export from the current home (which freezes it as
+// moved), import on the target, and restore the original if the import fails.
+
+/** One issue as it travels between environments: the board row plus its body. */
+export const BacklogExportIssue = Schema.Struct({
+  ...BacklogIssue.fields,
+  body: Schema.String,
+});
+export type BacklogExportIssue = typeof BacklogExportIssue.Type;
+
+/** Everything a backlog holds. Ids are global, so the target keeps them, numbers and keys. */
+export const BacklogExport = Schema.Struct({
+  backlog: Backlog,
+  /** The number the next new issue takes. */
+  nextNumber: Schema.Int.check(Schema.isGreaterThan(0)),
+  issues: Schema.Array(BacklogExportIssue),
+  activity: Schema.Array(BacklogActivity),
+});
+export type BacklogExport = typeof BacklogExport.Type;
+
+export const BacklogExportInput = Schema.Struct({
+  backlogId: BacklogId,
+  /** The environment receiving it; this copy becomes a read-only redirect there. */
+  to: Schema.Struct({ environmentId: EnvironmentId, label: Schema.String }),
+});
+export type BacklogExportInput = typeof BacklogExportInput.Type;
+
+export const BacklogImportInput = Schema.Struct({ export: BacklogExport });
+export type BacklogImportInput = typeof BacklogImportInput.Type;
+
+/** Undoes an export whose import did not finish: the backlog lives here again. */
+export const BacklogRestoreInput = Schema.Struct({ backlogId: BacklogId });
+export type BacklogRestoreInput = typeof BacklogRestoreInput.Type;
+
 // Fleet link: one environment (the spoke) links to another (the hub), whose
 // backlogs its agents then reach through their backlog tools.
 
@@ -406,6 +455,13 @@ export const BacklogLinkHubInput = Schema.Struct({
 export type BacklogLinkHubInput = typeof BacklogLinkHubInput.Type;
 
 // Derived helpers shared by server and clients.
+
+/** The message for any change to a backlog that moved away. */
+export function backlogMovedMessage(backlog: Pick<Backlog, "key" | "movedTo">): string {
+  return backlog.movedTo === undefined
+    ? `${backlog.key} lives here.`
+    : `${backlog.key} moved to ${backlog.movedTo.label}. This copy is read-only; use the board there.`;
+}
 
 export function isBacklogStatusClosed(status: BacklogIssueStatus): boolean {
   return status === "done" || status === "wontfix";

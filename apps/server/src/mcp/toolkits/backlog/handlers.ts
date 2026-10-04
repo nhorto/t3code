@@ -28,7 +28,8 @@ Plan in one place, then let agents work the frontier. Each backlog issue is eith
 - Never modify the parent spec while working a child. Raise disagreements as a backlog_comment on the parent and tell the user.
 - When a slice finishes, its dependents join the frontier. Repeat until the frontier is empty, then report what is in review.
 - Claims are leases. They hold while your thread is running or was active in the last 2 hours, so stopping to ask the user a question keeps them; after that they expire within about 15 minutes, returning the issue to ready. A user can force-release any claim.
-- Issues may live on another machine: when this machine is linked to a backlog hub, keys resolve there too and every tool routes automatically. If the hub is unreachable, tools fail with code unavailable; say so rather than working around it.`;
+- Issues may live on another machine: when this machine is linked to a backlog hub, keys resolve there too and every tool routes automatically. If the hub is unreachable, reads answer from what it last reported, marked stale: true with asOf, and changes fail with code unavailable; say so rather than working around it.
+- A backlog can move to another machine. Its old copy stays as a read-only redirect: changes fail with a conflict naming where it went, and when it went to the linked hub, keys follow it there automatically.`;
 
 /** The caller's thread is the actor, and any backlog call keeps its claims here alive. */
 const access = Effect.gen(function* () {
@@ -55,8 +56,8 @@ export const BacklogHandlersLive = BacklogToolkit.toLayer({
   backlog_list_issues: ({ limit, ...input }) =>
     Effect.gen(function* () {
       const { router } = yield* access;
-      const { issues, hub } = yield* router.listIssues(input);
-      return { issues: issues.slice(0, limit ?? 100), total: issues.length, hub };
+      const { issues, ...rest } = yield* router.listIssues(input);
+      return { ...rest, issues: issues.slice(0, limit ?? 100), total: issues.length };
     }),
   backlog_get_issue: (input) =>
     Effect.gen(function* () {

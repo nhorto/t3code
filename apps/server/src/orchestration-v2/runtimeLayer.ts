@@ -52,7 +52,6 @@ import { layer as threadForkServiceLayer } from "./ThreadForkService.ts";
 import { layer as turnItemPositionStoreLayer } from "./TurnItemPositionStore.ts";
 import { layer as scheduledTaskServiceLayer } from "../scheduledTasks/ScheduledTaskService.ts";
 import { layer as backlogServiceLayer } from "../backlog/BacklogService.ts";
-import { layer as agentMessageServiceLayer } from "../agentMessages/AgentMessageService.ts";
 
 /** The shared application event log and its command receipts. */
 export const OrchestrationEventInfrastructureLayerLive = Layer.mergeAll(
@@ -264,9 +263,6 @@ const scheduledTaskProvided = scheduledTaskServiceLayer.pipe(
 const backlogProvided = backlogServiceLayer.pipe(
   Layer.provide(Layer.mergeAll(threadManagementProvided, ProjectServiceLayerLive)),
 );
-const agentMessageProvided = agentMessageServiceLayer.pipe(
-  Layer.provide(Layer.mergeAll(threadManagementProvided, backlogProvided)),
-);
 const providerContinuationWorkerProvided = providerContinuationWorkerLive.pipe(
   Layer.provide(
     Layer.mergeAll(providerContinuationRequestsLayer, threadManagementProvided, idAllocatorLayer),
@@ -323,7 +319,6 @@ export const OrchestrationV2ProductionLayerLive = Layer.mergeAll(
   threadLifecycleProvided,
   scheduledTaskProvided,
   backlogProvided,
-  agentMessageProvided,
   UsageLimitRecoveryWorker.workerLive.pipe(
     Layer.provide(Layer.mergeAll(projectionStoreLayer, threadManagementProvided)),
   ),

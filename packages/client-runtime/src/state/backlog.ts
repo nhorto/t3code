@@ -1,5 +1,6 @@
 import {
   BACKLOG_ISSUE_STATUSES,
+  isBacklogStatusClosed,
   WS_METHODS,
   isBacklogIssueBlocked,
   type Backlog,
@@ -11,14 +12,23 @@ import {
   type EnvironmentId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 
-import type { EnvironmentRegistry } from "../connection/registry.ts";
+import { EnvironmentRegistry } from "../connection/registry.ts";
+import * as EnvironmentSupervisor from "../connection/supervisor.ts";
+import { safeErrorLogAttributes } from "../errors/safeLog.ts";
+import * as Persistence from "../platform/persistence.ts";
+import { request } from "../rpc/client.ts";
+import { runCachePersistence } from "./cachePersistence.ts";
 import {
   createAtomCommandScheduler,
+  createRuntimeCommand,
   createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
   createEnvironmentRpcSubscriptionAtomFamily,
@@ -29,6 +39,10 @@ export interface BacklogBoardState {
   readonly backlogs: ReadonlyArray<Backlog>;
   readonly issues: ReadonlyArray<BacklogIssue>;
   readonly issuesById: ReadonlyMap<BacklogIssueId, BacklogIssue>;
+  /** When the board last heard from its environment. */
+  readonly asOf?: string;
+  /** Loaded from this client's cache and not yet confirmed by the environment: read-only. */
+  readonly fromCache?: true;
 }
 
 export const EMPTY_BACKLOG_BOARD: BacklogBoardState = {
@@ -70,6 +84,93 @@ export function foldBacklogStreamEvent(
       return { ...state, issues, issuesById };
     }
   }
+}
+
+/** Closed issues older than this are left out of the offline copy. */
+export const BACKLOG_CACHE_CLOSED_RETENTION_MS = 30 * 24 * 60 * 60_000;
+/** The most issues the offline copy keeps, newest-updated first. */
+export const BACKLOG_CACHE_MAX_ISSUES = 2_000;
+
+/**
+ * The board as this client stores it for offline viewing: every backlog, and
+ * every issue except those closed more than 30 days ago, capped in count.
+ */
+export function backlogBoardForCache(
+  environmentId: EnvironmentId,
+  board: BacklogBoardState,
+  nowMs: number,
+): Persistence.StoredBacklogBoard {
+  const isoAt = (ms: number) => DateTime.formatIso(DateTime.makeUnsafe(ms));
+  const cutoff = isoAt(nowMs - BACKLOG_CACHE_CLOSED_RETENTION_MS);
+  let issues = board.issues.filter(
+    (issue) =>
+      !isBacklogStatusClosed(issue.status) || issue.closedAt === null || issue.closedAt >= cutoff,
+  );
+  if (issues.length > BACKLOG_CACHE_MAX_ISSUES) {
+    // `filter` above already copied the array, so sorting in place is safe.
+    issues = issues
+      .sort((left, right) => (left.updatedAt < right.updatedAt ? 1 : -1))
+      .slice(0, BACKLOG_CACHE_MAX_ISSUES);
+  }
+  return {
+    schemaVersion: 1,
+    environmentId,
+    asOf: board.asOf ?? isoAt(nowMs),
+    backlogs: board.backlogs,
+    issues,
+  };
+}
+
+export function backlogBoardFromCache(stored: Persistence.StoredBacklogBoard): BacklogBoardState {
+  return { ...fromIssues(stored.backlogs, stored.issues), asOf: stored.asOf, fromCache: true };
+}
+
+/**
+ * The live board, preceded by this client's last copy of it when there is
+ * one, which is saved again as the live board changes. The copy is what a
+ * restarted client shows while the environment is out of reach.
+ */
+function withBoardCache<E, R>(
+  live: Stream.Stream<BacklogStreamEvent, E, R>,
+): Stream.Stream<BacklogBoardState, E, R | EnvironmentSupervisor.EnvironmentSupervisor> {
+  return Stream.unwrap(
+    Effect.gen(function* () {
+      const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
+      const environmentId = supervisor.target.environmentId;
+      const store = yield* Persistence.BacklogBoardCacheStore;
+      const logged = <A>(message: string, fallback: A) =>
+        Effect.catch((error: Persistence.ConnectionPersistenceError) =>
+          Effect.logWarning(message).pipe(
+            Effect.annotateLogs({ environmentId, ...safeErrorLogAttributes(error) }),
+            Effect.as(fallback),
+          ),
+        );
+      const cached = yield* store
+        .load(environmentId)
+        .pipe(logged("Could not load the cached backlog board.", Option.none()));
+      const pending = yield* Queue.sliding<BacklogBoardState>(1);
+      yield* runCachePersistence(pending, (board) =>
+        Clock.currentTimeMillis.pipe(
+          Effect.flatMap((nowMs) => store.save(backlogBoardForCache(environmentId, board, nowMs))),
+          logged("Could not save the backlog board for offline use.", undefined),
+        ),
+      ).pipe(Effect.forkScoped);
+      const boards = live.pipe(
+        Stream.scan(EMPTY_BACKLOG_BOARD, foldBacklogStreamEvent),
+        // Drop scan's seed so the board stays loading until the snapshot, never falsely empty.
+        Stream.drop(1),
+        Stream.mapEffect((board) =>
+          DateTime.now.pipe(
+            Effect.map((now): BacklogBoardState => ({ ...board, asOf: DateTime.formatIso(now) })),
+          ),
+        ),
+        Stream.tap((board) => Queue.offer(pending, board)),
+      );
+      return Option.isSome(cached)
+        ? Stream.concat(Stream.make(backlogBoardFromCache(cached.value)), boards)
+        : boards;
+    }),
+  );
 }
 
 export function issuesForBacklog(
@@ -130,6 +231,36 @@ export function isBacklogUnsupportedCause(cause: Cause.Cause<unknown>): boolean 
   });
 }
 
+/** Moving a backlog's home from one environment to another. */
+export interface BacklogMoveTarget {
+  readonly from: EnvironmentId;
+  readonly backlogId: BacklogId;
+  readonly to: { readonly environmentId: EnvironmentId; readonly label: string };
+}
+
+/**
+ * Exports the backlog from its home, which leaves a read-only redirect there,
+ * and imports it on the target. When the import fails the export is undone,
+ * so the board is never left without a live home.
+ */
+export const moveBacklogHome = ({ from, backlogId, to }: BacklogMoveTarget) =>
+  Effect.gen(function* () {
+    const registry = yield* EnvironmentRegistry;
+    const exported = yield* registry.run(
+      from,
+      request(WS_METHODS.backlogExportBacklog, { backlogId, to }),
+    );
+    return yield* registry
+      .run(to.environmentId, request(WS_METHODS.backlogImportBacklog, { export: exported }))
+      .pipe(
+        Effect.tapError(() =>
+          registry
+            .run(from, request(WS_METHODS.backlogRestoreBacklog, { backlogId }))
+            .pipe(Effect.ignore),
+        ),
+      );
+  });
+
 export function createBacklogEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
 ) {
@@ -143,9 +274,7 @@ export function createBacklogEnvironmentAtoms<R, E>(
   const board = createEnvironmentRpcSubscriptionAtomFamily(runtime, {
     label: "environment-data:backlog:board",
     tag: WS_METHODS.backlogSubscribe,
-    // Drop scan's seed so the board stays loading until the snapshot, never falsely empty.
-    transform: (stream) =>
-      stream.pipe(Stream.scan(EMPTY_BACKLOG_BOARD, foldBacklogStreamEvent), Stream.drop(1)),
+    transform: withBoardCache,
   });
 
   /** Changes whenever the issue's row changes, so its detail refetches. */
@@ -224,6 +353,18 @@ export function createBacklogEnvironmentAtoms<R, E>(
     updateBacklog: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:backlog:update-backlog",
       tag: WS_METHODS.backlogUpdateBacklog,
+      scheduler,
+      concurrency: serialPerEnvironment,
+    }),
+    moveBacklog: createRuntimeCommand(runtime, {
+      label: "environment-data:backlog:move-backlog",
+      execute: moveBacklogHome,
+      scheduler,
+    }),
+    /** Makes a moved backlog live on this environment again, e.g. after a move that never landed. */
+    restoreBacklog: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:backlog:restore-backlog",
+      tag: WS_METHODS.backlogRestoreBacklog,
       scheduler,
       concurrency: serialPerEnvironment,
     }),

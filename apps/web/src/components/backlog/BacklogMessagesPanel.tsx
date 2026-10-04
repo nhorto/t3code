@@ -17,12 +17,15 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "..
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import {
   AGENT_MESSAGE_STATUS_LABELS,
+  agentMessageMachineLabel,
   agentMessagePreview,
   buildAgentMessageFeed,
+  canActOnAgentMessage,
   type AgentMessageRow,
 } from "./agentMessages.logic";
 
 const STATUS_BADGE = {
+  pending: "outline",
   delivered: "secondary",
   held: "warning",
   released: "info",
@@ -88,7 +91,12 @@ export function BacklogMessagesPanel({ onClose }: { readonly onClose: () => void
               Held for you · over 10 agent wakes an hour
             </h3>
             {view.held.map((row) => (
-              <AgentMessageItem key={row.key} row={row} onOpenThread={openThread} actions />
+              <AgentMessageItem
+                key={row.key}
+                row={row}
+                onOpenThread={openThread}
+                actions={canActOnAgentMessage(row)}
+              />
             ))}
           </section>
         ) : null}
@@ -183,7 +191,7 @@ function AgentMessageItem({
       {message.error ? <p className="text-xs text-destructive">{message.error}</p> : null}
       <div className="flex items-center gap-2 text-xs text-muted-foreground">
         <span>
-          {row.machineLabel} · {formatRelativeTimeLabel(message.createdAt)}
+          {agentMessageMachineLabel(row)} · {formatRelativeTimeLabel(message.createdAt)}
         </span>
         {actions ? (
           <span className="ml-auto flex items-center gap-2">

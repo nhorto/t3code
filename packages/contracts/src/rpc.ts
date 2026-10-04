@@ -339,12 +339,21 @@ import {
   BacklogListIssuesInput,
   BacklogRenewClaimsInput,
   BacklogResolveIssueInput,
+  BacklogExport,
+  BacklogExportInput,
+  BacklogImportInput,
+  BacklogRestoreInput,
 } from "./backlog.ts";
 import {
   AgentMessage,
+  AgentMessageAckInput,
   AgentMessageActionInput,
+  AgentMessageEnvelope,
   AgentMessageError,
+  AgentMessageInboxEvent,
+  AgentMessageRelayReceipt,
   AgentMessageStreamEvent,
+  AgentMessagesSubscribeInboxInput,
   AgentMessagesSubscribeInput,
 } from "./agentMessage.ts";
 import {
@@ -526,11 +535,18 @@ export const WS_METHODS = {
   backlogGetHubLink: "backlog.getHubLink",
   backlogLinkHub: "backlog.linkHub",
   backlogUnlinkHub: "backlog.unlinkHub",
+  backlogExportBacklog: "backlog.exportBacklog",
+  backlogImportBacklog: "backlog.importBacklog",
+  backlogRestoreBacklog: "backlog.restoreBacklog",
 
   // Agent messages
   agentMessagesSubscribe: "agentMessages.subscribe",
   agentMessagesRelease: "agentMessages.release",
   agentMessagesDismiss: "agentMessages.dismiss",
+  agentMessagesSubscribeHeldCount: "agentMessages.subscribeHeldCount",
+  agentMessagesRelay: "agentMessages.relay",
+  agentMessagesSubscribeInbox: "agentMessages.subscribeInbox",
+  agentMessagesAck: "agentMessages.ack",
 
   // Cloud environment methods
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
@@ -1835,6 +1851,55 @@ const WsBacklogUnlinkHubRpc = Rpc.make(WS_METHODS.backlogUnlinkHub, {
   error: BacklogRpcError,
 });
 
+/**
+ * Moving a backlog's home, orchestrated by a client: export on the current
+ * home (which leaves a read-only redirect), import on the target, and restore
+ * the original if the import fails.
+ */
+const WsBacklogExportBacklogRpc = Rpc.make(WS_METHODS.backlogExportBacklog, {
+  payload: BacklogExportInput,
+  success: BacklogExport,
+  error: BacklogRpcError,
+});
+
+const WsBacklogImportBacklogRpc = Rpc.make(WS_METHODS.backlogImportBacklog, {
+  payload: BacklogImportInput,
+  success: Backlog,
+  error: BacklogRpcError,
+});
+
+const WsBacklogRestoreBacklogRpc = Rpc.make(WS_METHODS.backlogRestoreBacklog, {
+  payload: BacklogRestoreInput,
+  success: Backlog,
+  error: BacklogRpcError,
+});
+
+const AgentMessageRpcError = Schema.Union([AgentMessageError, EnvironmentAuthorizationError]);
+
+// The hub's post office for agent messages between linked machines.
+
+/** Accepts a message for a thread on any machine linked to this hub. */
+const WsAgentMessagesRelayRpc = Rpc.make(WS_METHODS.agentMessagesRelay, {
+  payload: AgentMessageEnvelope,
+  success: AgentMessageRelayReceipt,
+  error: AgentMessageRpcError,
+});
+
+/** A linked machine's inbox: messages waiting for its threads, and acks for the ones it sent. */
+const WsAgentMessagesSubscribeInboxRpc = Rpc.make(WS_METHODS.agentMessagesSubscribeInbox, {
+  payload: AgentMessagesSubscribeInboxInput,
+  success: AgentMessageInboxEvent,
+  error: AgentMessageRpcError,
+  stream: true,
+});
+
+/** The receiving machine reports what became of a relayed message. */
+const WsAgentMessagesAckRpc = Rpc.make(WS_METHODS.agentMessagesAck, {
+  payload: AgentMessageAckInput,
+  success: Schema.Void,
+  error: AgentMessageRpcError,
+});
+
 /** What a linked server calls on its hub; every RPC here is also in WsRpcGroup. */
 export const BacklogHubRpcGroup = RpcGroup.make(
   WsBacklogListBacklogsRpc,
@@ -1850,9 +1915,10 @@ export const BacklogHubRpcGroup = RpcGroup.make(
   WsBacklogReleaseRpc,
   WsBacklogRenewClaimsRpc,
   WsBacklogLinkPullRequestRpc,
+  WsAgentMessagesRelayRpc,
+  WsAgentMessagesSubscribeInboxRpc,
+  WsAgentMessagesAckRpc,
 );
-
-const AgentMessageRpcError = Schema.Union([AgentMessageError, EnvironmentAuthorizationError]);
 
 /** Streams this environment's agent message log: recent messages and every held one, then deltas. */
 const WsAgentMessagesSubscribeRpc = Rpc.make(WS_METHODS.agentMessagesSubscribe, {
@@ -1873,6 +1939,14 @@ const WsAgentMessagesDismissRpc = Rpc.make(WS_METHODS.agentMessagesDismiss, {
   payload: AgentMessageActionInput,
   success: AgentMessage,
   error: AgentMessageRpcError,
+});
+
+/** How many messages this environment holds for the user, for badges that need no feed. */
+const WsAgentMessagesSubscribeHeldCountRpc = Rpc.make(WS_METHODS.agentMessagesSubscribeHeldCount, {
+  payload: Schema.Struct({}),
+  success: NonNegativeInt,
+  error: AgentMessageRpcError,
+  stream: true,
 });
 
 const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess, {
@@ -1978,9 +2052,16 @@ export const WsRpcGroup = RpcGroup.make(
   WsBacklogGetHubLinkRpc,
   WsBacklogLinkHubRpc,
   WsBacklogUnlinkHubRpc,
+  WsBacklogExportBacklogRpc,
+  WsBacklogImportBacklogRpc,
+  WsBacklogRestoreBacklogRpc,
   WsAgentMessagesSubscribeRpc,
   WsAgentMessagesReleaseRpc,
   WsAgentMessagesDismissRpc,
+  WsAgentMessagesSubscribeHeldCountRpc,
+  WsAgentMessagesRelayRpc,
+  WsAgentMessagesSubscribeInboxRpc,
+  WsAgentMessagesAckRpc,
   WsServerReportClientActivityRpc,
   WsServerReportHostPowerStateRpc,
   WsServerGetBackgroundPolicyRpc,

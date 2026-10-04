@@ -11,6 +11,7 @@ const dependentLayer = Layer.mergeAll(
   MobilePreferences.layer,
   MobileStorage.layer,
   EnvironmentCacheStore.layer,
+  EnvironmentCacheStore.backlogBoardLayer,
 ).pipe(Layer.provide(baseLayer));
 
 export const layer = Layer.merge(baseLayer, dependentLayer);

@@ -119,9 +119,18 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.backlogGetHubLink]: AuthAccessReadScope,
   [WS_METHODS.backlogLinkHub]: AuthAccessWriteScope,
   [WS_METHODS.backlogUnlinkHub]: AuthAccessWriteScope,
+  // Moving a board's home is an admin action, and a spoke's backlog link must not freeze boards.
+  [WS_METHODS.backlogExportBacklog]: AuthAccessWriteScope,
+  [WS_METHODS.backlogImportBacklog]: AuthAccessWriteScope,
+  [WS_METHODS.backlogRestoreBacklog]: AuthAccessWriteScope,
   [WS_METHODS.agentMessagesSubscribe]: AuthOrchestrationReadScope,
   [WS_METHODS.agentMessagesRelease]: AuthOrchestrationOperateScope,
   [WS_METHODS.agentMessagesDismiss]: AuthOrchestrationOperateScope,
+  [WS_METHODS.agentMessagesSubscribeHeldCount]: AuthOrchestrationReadScope,
+  // The hub's relay rides the fleet link; orchestration:operate implies backlog:write.
+  [WS_METHODS.agentMessagesRelay]: AuthBacklogWriteScope,
+  [WS_METHODS.agentMessagesSubscribeInbox]: AuthBacklogWriteScope,
+  [WS_METHODS.agentMessagesAck]: AuthBacklogWriteScope,
   [WS_METHODS.cloudGetRelayClientStatus]: AuthRelayReadScope,
   [WS_METHODS.cloudInstallRelayClient]: AuthRelayWriteScope,
   [WS_METHODS.pullRequestsList]: AuthOrchestrationReadScope,

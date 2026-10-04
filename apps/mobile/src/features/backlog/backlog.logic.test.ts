@@ -11,6 +11,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   backlogMoveTargets,
+  backlogReadOnlyReason,
   buildBacklogListItems,
   buildBacklogScopes,
   creatableProjectIdsOn,
@@ -451,5 +452,93 @@ describe("issue actions", () => {
       "Claude · Geekom",
     );
     expect(describeBacklogClaim(claim, () => null)).toBe("Claude");
+  });
+});
+
+describe("offline and moved boards", () => {
+  const formatTime = () => "2h ago";
+
+  it("explains why an issue cannot change: out of reach, still loading, or moved away", () => {
+    const saved = { asOf: AT, fromCache: true as const };
+    expect(
+      backlogReadOnlyReason({
+        connected: false,
+        board: saved,
+        backlog: null,
+        label: "Geekom",
+        formatTime,
+      }),
+    ).toBe("Offline — showing Geekom's board as of 2h ago; changes are disabled.");
+    expect(
+      backlogReadOnlyReason({
+        connected: true,
+        board: saved,
+        backlog: null,
+        label: "Geekom",
+        formatTime,
+      }),
+    ).toBe("Loading Geekom…");
+    expect(
+      backlogReadOnlyReason({
+        connected: true,
+        board: { asOf: AT },
+        backlog: null,
+        label: "Geekom",
+        formatTime,
+      }),
+    ).toBeNull();
+    expect(
+      backlogReadOnlyReason({
+        connected: true,
+        board: { asOf: AT },
+        backlog: {
+          key: "WINE",
+          movedTo: { environmentId: GEEKOM, label: "Geekom", movedAt: AT },
+        },
+        label: "Laptop",
+        formatTime,
+      }),
+    ).toBe("WINE moved to Geekom. This copy is read-only.");
+  });
+
+  it("shows a moved board once, from its new home, and never adds to the redirect", () => {
+    const wine = backlog(
+      "wine",
+      "project",
+      "Cork & Note",
+      WINE_ON_LAPTOP,
+      "github.com/nhorto/cork-and-note",
+    );
+    const redirect = {
+      ...wine,
+      movedTo: { environmentId: GEEKOM, label: "Geekom", movedAt: AT },
+    };
+    const onLaptop: EnvironmentBacklogBoard = {
+      environmentId: LAPTOP,
+      board: board([redirect], [issue("a", "wine")]),
+    };
+    const onGeekom: EnvironmentBacklogBoard = {
+      environmentId: GEEKOM,
+      board: board([wine], [issue("a", "wine")]),
+    };
+    const both = resolveBacklogScope(
+      buildBacklogScopes({ boards: [onLaptop, onGeekom], projectGroups: [wineGroup] }),
+      "project:repo:wine",
+    );
+    expect(both.backlogs.map((entry) => entry.environmentId)).toEqual([GEEKOM]);
+    expect(resolveBacklogCreateTarget(both, [env(LAPTOP), env(GEEKOM)]).target).toEqual({
+      environmentId: GEEKOM,
+      input: { backlogId: "wine" },
+    });
+
+    const alone = resolveBacklogScope(
+      buildBacklogScopes({ boards: [onLaptop], projectGroups: [wineGroup] }),
+      "project:repo:wine",
+    );
+    expect(resolveBacklogCreateTarget(alone, [env(LAPTOP), env(GEEKOM, "offline")])).toEqual({
+      target: null,
+      blockedReason: "Cork & Note moved to Geekom, which is not connected.",
+      loading: false,
+    });
   });
 });

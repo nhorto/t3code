@@ -387,18 +387,29 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
     }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
   );
 
-  it.effect("redeems a standard pairing link as a year-long, backlog-only hub link", () =>
+  it.effect("gives only a link minted backlog-only a year-long hub link", () =>
     Effect.gen(function* () {
       const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
-      const pairingCredential = yield* serverAuth.issuePairingCredential();
-
+      const backlogOnly = yield* serverAuth.issuePairingCredential({
+        scopes: ["backlog:read", "backlog:write"],
+      });
       const link = yield* serverAuth.exchangeBootstrapCredentialForAccessToken(
-        pairingCredential.credential,
+        backlogOnly.credential,
         ["backlog:read", "backlog:write"],
         requestMetadata,
       );
       expect(link.scope).toBe("backlog:read backlog:write");
       expect(link.expires_in).toBeGreaterThan(300 * 24 * 60 * 60);
+
+      // A standard link narrowed to backlog scopes is not a year-long bearer.
+      const pairingCredential = yield* serverAuth.issuePairingCredential();
+      const narrowed = yield* serverAuth.exchangeBootstrapCredentialForAccessToken(
+        pairingCredential.credential,
+        ["backlog:read", "backlog:write"],
+        requestMetadata,
+      );
+      expect(narrowed.scope).toBe("backlog:read backlog:write");
+      expect(narrowed.expires_in).toBeLessThanOrEqual(30 * 24 * 60 * 60);
 
       const standard = yield* serverAuth.issuePairingCredential();
       const client = yield* serverAuth.exchangeBootstrapCredentialForAccessToken(

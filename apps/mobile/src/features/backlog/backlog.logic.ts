@@ -43,10 +43,45 @@ export const BACKLOG_PRIORITIES: ReadonlyArray<BacklogIssuePriority> = ["p0", "p
 export const ALL_BACKLOG_SCOPE_KEY = "all";
 export const INBOX_BACKLOG_SCOPE_KEY = "inbox";
 
-/** One environment's live board, once its snapshot has arrived. */
+/** One environment's board: live once its snapshot arrived, else the last copy this device saved. */
 export interface EnvironmentBacklogBoard {
   readonly environmentId: EnvironmentId;
   readonly board: BacklogBoardState;
+}
+
+/**
+ * Why an issue on this board cannot be changed right now, or null when it can: the
+ * environment is out of reach (the board is its last known state), or the board moved.
+ */
+export function backlogReadOnlyReason(input: {
+  readonly connected: boolean;
+  readonly board: Pick<BacklogBoardState, "asOf" | "fromCache"> | null;
+  readonly backlog: Pick<Backlog, "key" | "movedTo"> | null;
+  readonly label: string;
+  readonly formatTime: (iso: string) => string;
+}): string | null {
+  const movedTo = input.backlog?.movedTo;
+  if (input.backlog !== null && movedTo !== undefined) {
+    return `${input.backlog.key} moved to ${movedTo.label}. This copy is read-only.`;
+  }
+  if (input.connected && input.board?.fromCache !== true) return null;
+  if (input.connected) return `Loading ${input.label}…`;
+  const asOf = input.board?.asOf;
+  return asOf === undefined
+    ? `Offline — ${input.label} is not connected; changes are disabled.`
+    : `Offline — showing ${input.label}'s board as of ${input.formatTime(asOf)}; changes are disabled.`;
+}
+
+/** A move leaves a redirect with the same backlog id; once the board itself is visible, drop it. */
+function withoutSupersededRedirects(
+  entries: ReadonlyArray<ScopedBacklog>,
+): ReadonlyArray<ScopedBacklog> {
+  const live = new Set(
+    entries.filter((entry) => entry.backlog.movedTo === undefined).map((entry) => entry.backlog.id),
+  );
+  return entries.filter(
+    (entry) => entry.backlog.movedTo === undefined || !live.has(entry.backlog.id),
+  );
 }
 
 export interface BacklogProjectRef {
@@ -102,8 +137,10 @@ export function buildBacklogScopes(input: {
   readonly boards: ReadonlyArray<EnvironmentBacklogBoard>;
   readonly projectGroups: ReadonlyArray<BacklogProjectGroup>;
 }): ReadonlyArray<BacklogScope> {
-  const allBacklogs: ScopedBacklog[] = input.boards.flatMap(({ environmentId, board }) =>
-    board.backlogs.map((backlog) => ({ environmentId, backlog })),
+  const allBacklogs = withoutSupersededRedirects(
+    input.boards.flatMap(({ environmentId, board }) =>
+      board.backlogs.map((backlog) => ({ environmentId, backlog })),
+    ),
   );
   const inboxBacklogs = allBacklogs.filter((entry) => entry.backlog.kind === "inbox");
   const groupKeyByProjectRef = new Map<string, string>();
@@ -364,7 +401,7 @@ export function resolveBacklogCreateTarget(
   const order = (environmentId: EnvironmentId) =>
     ready.findIndex((environment) => environment.environmentId === environmentId);
   const hosted = scope.backlogs
-    .filter((entry) => order(entry.environmentId) !== -1)
+    .filter((entry) => order(entry.environmentId) !== -1 && entry.backlog.movedTo === undefined)
     .filter((entry) => (scope.kind === "project" ? true : entry.backlog.kind === "inbox"))
     .sort((left, right) => order(left.environmentId) - order(right.environmentId))[0];
   if (hosted) {
@@ -387,6 +424,11 @@ export function resolveBacklogCreateTarget(
     return loading.length > 0
       ? blocked(`Loading ${joinLabels(loading)}…`, true)
       : blocked("Connect an environment to add to the backlog.");
+  }
+  const movedTo = scope.backlogs.find((entry) => entry.backlog.movedTo !== undefined)?.backlog
+    .movedTo;
+  if (movedTo !== undefined) {
+    return blocked(`${scope.label} moved to ${movedTo.label}, which is not connected.`);
   }
   if (scope.backlogs.length > 0) {
     return blocked(`The environment holding ${scope.label} is not connected.`);
@@ -465,8 +507,9 @@ export function backlogMoveTargets(
 ): ReadonlyArray<BacklogMoveTarget> {
   const byLabel = (left: BacklogMoveTarget, right: BacklogMoveTarget) =>
     left.label.localeCompare(right.label, undefined, { sensitivity: "base" });
+  const liveBacklogs = board.backlogs.filter((backlog) => backlog.movedTo === undefined);
   const backlogByProjectId = new Map(
-    board.backlogs.flatMap((backlog) =>
+    liveBacklogs.flatMap((backlog) =>
       backlog.kind === "project" && backlog.projectId !== null
         ? [[backlog.projectId, backlog] as const]
         : [],
@@ -478,7 +521,7 @@ export function backlogMoveTargets(
     label: backlog.title,
     patch: { backlogId: backlog.id },
   });
-  const inbox = board.backlogs.filter((backlog) => backlog.kind === "inbox").map(backlogTarget);
+  const inbox = liveBacklogs.filter((backlog) => backlog.kind === "inbox").map(backlogTarget);
   const projectTargets = projects.flatMap((project): BacklogMoveTarget[] => {
     const backlog = backlogByProjectId.get(project.id);
     if (backlog) return [{ ...backlogTarget(backlog), label: project.title }];
@@ -486,7 +529,7 @@ export function backlogMoveTargets(
       ? [{ key: `project:${project.id}`, label: project.title, patch: { projectId: project.id } }]
       : [];
   });
-  const orphans = board.backlogs
+  const orphans = liveBacklogs
     .filter(
       (backlog) =>
         backlog.kind === "project" &&

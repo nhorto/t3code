@@ -21,6 +21,7 @@ import {
   backlogChildProgress,
   boardIssueKey,
   isBacklogSourceWritable,
+  movedBacklogIds,
   openBlockerKeys,
   pageBacklogColumn,
   type BacklogChildProgress,
@@ -40,6 +41,8 @@ type CardDerivedProps = Omit<BacklogCardProps, "status" | "selected" | "readOnly
 interface SourceIndex {
   readonly source: BacklogSource;
   readonly childProgress: ReadonlyMap<BacklogIssueId, BacklogChildProgress>;
+  /** Backlogs that moved to another machine: their cards here are read-only. */
+  readonly moved: ReadonlySet<string>;
 }
 
 export interface BacklogBoardProps {
@@ -75,6 +78,7 @@ export function BacklogBoard({
           {
             source,
             childProgress: backlogChildProgress(source.board?.issues ?? []),
+            moved: movedBacklogIds(source.board),
           } satisfies SourceIndex,
         ]),
       ),
@@ -135,14 +139,19 @@ export function BacklogBoard({
             column={column}
             renderCard={(item) => {
               const key = boardIssueKey(item.environmentId, item.issue.id);
-              const source = index.get(item.environmentId)?.source;
+              const entry = index.get(item.environmentId);
+              const source = entry?.source;
               return (
                 <BacklogCard
                   key={key}
                   {...cardProps(item)}
                   status={column.status}
                   selected={key === selectedKey}
-                  readOnly={!source || !isBacklogSourceWritable(source)}
+                  readOnly={
+                    !source ||
+                    !isBacklogSourceWritable(source) ||
+                    entry.moved.has(item.issue.backlogId)
+                  }
                   onOpen={onOpen}
                 />
               );

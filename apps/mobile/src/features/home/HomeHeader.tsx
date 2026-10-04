@@ -8,6 +8,7 @@ import {
   createNativeMailSearchToolbarItem,
   NATIVE_MAIL_SEARCH_TOOLBAR_SUPPORTED,
 } from "../layout/native-mail-search-toolbar";
+import { useHeldAgentMessageCount } from "../backlog/useAgentMessages";
 import { buildHomeListFilterMenu } from "./home-list-filter-menu";
 import type { HomeHeaderProps } from "./HomeHeader.types";
 
@@ -27,23 +28,29 @@ export function HomeHeader(props: HomeHeaderProps) {
   }, []);
   useHardwareKeyboardCommand("focusSearch", focusSearch);
   const filterMenu = buildHomeListFilterMenu(props);
+  const heldMessageCount = useHeldAgentMessageCount();
 
   return (
     <>
       <NativeStackScreenOptions
-        optionsVersion={filterMenu.items}
+        optionsVersion={[filterMenu.items, heldMessageCount]}
         options={{
           // Static header config (glass, title, fonts) lives in Stack.tsx
           // (GLASS_HEADER_OPTIONS). Only dynamic values are set here.
           headerTintColor: iconColor,
           unstable_headerRightItems: () => [
             withNativeGlassHeaderItem({
-              accessibilityLabel: "Open backlog",
+              accessibilityLabel:
+                heldMessageCount > 0
+                  ? `Open backlog, ${heldMessageCount} messages held`
+                  : "Open backlog",
               icon: { name: "checklist", type: "sfSymbol" } as const,
               identifier: "home-backlog",
               label: "",
               onPress: props.onOpenBacklog,
               type: "button",
+              // Held agent messages wait for the user; the badge shows on iOS 26+.
+              ...(heldMessageCount > 0 ? { badge: { value: heldMessageCount } } : {}),
             }),
             withNativeGlassHeaderItem({
               accessibilityLabel: "Open settings",

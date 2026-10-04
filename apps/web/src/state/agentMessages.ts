@@ -8,7 +8,6 @@ import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { useMemo } from "react";
 
-import { countHeldAgentMessageRows } from "../components/backlog/agentMessages.logic";
 import { connectionAtomRuntime } from "../connection/runtime";
 import { useEnvironments } from "./environments";
 import { formatEnvironmentQueryError } from "./query";
@@ -58,8 +57,21 @@ export function useAgentMessageFeeds(): ReadonlyArray<EnvironmentAgentMessageFee
   return useAtomValue(feedsAtom(JSON.stringify(environmentIds)));
 }
 
+/** Held counts summed across environments; subscribes to counts only, never the feeds. */
+const heldCountAtom = Atom.family((key: string) =>
+  Atom.make((get): number => {
+    const environmentIds = JSON.parse(key) as ReadonlyArray<EnvironmentId>;
+    let total = 0;
+    for (const environmentId of environmentIds) {
+      const result = get(agentMessageEnvironment.heldCount({ environmentId, input: {} }));
+      total += Option.getOrElse(AsyncResult.value(result), () => 0);
+    }
+    return total;
+  }).pipe(Atom.withLabel(`web-agent-messages:held-count:${key}`)),
+);
+
 /** Messages held for the user across every connected machine; drives the Backlog badge. */
 export function useHeldAgentMessageCount(): number {
-  const feeds = useAgentMessageFeeds();
-  return useMemo(() => countHeldAgentMessageRows(feeds), [feeds]);
+  const environmentIds = useMessagingEnvironmentIds();
+  return useAtomValue(heldCountAtom(JSON.stringify(environmentIds)));
 }

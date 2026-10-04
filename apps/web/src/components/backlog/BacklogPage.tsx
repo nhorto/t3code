@@ -1,4 +1,7 @@
-import { isAtomCommandInterrupted } from "@t3tools/client-runtime/state/runtime";
+import {
+  isAtomCommandInterrupted,
+  type AtomCommandResult,
+} from "@t3tools/client-runtime/state/runtime";
 import type {
   BacklogIssueId,
   BacklogIssuePriority,
@@ -9,6 +12,7 @@ import type {
 import { useNavigate } from "@tanstack/react-router";
 import {
   ChevronDownIcon,
+  EllipsisIcon,
   SquareKanbanIcon,
   ListFilterIcon,
   MessagesSquareIcon,
@@ -18,6 +22,8 @@ import {
 import { useCallback, useMemo, useState } from "react";
 
 import { isElectron } from "../../env";
+import { useClientSettings } from "../../hooks/useSettings";
+import { formatDayAwareTimestamp } from "../../timestampFormat";
 import { useEscapeToGoBack } from "../../hooks/useNavigateBack";
 import { useHeldAgentMessageCount } from "../../state/agentMessages";
 import { backlogEnvironment, backlogFailureMessage } from "../../state/backlog";
@@ -31,6 +37,7 @@ import {
   MenuCheckboxItem,
   MenuGroup,
   MenuGroupLabel,
+  MenuItem,
   MenuPopup,
   MenuRadioGroup,
   MenuRadioItem,
@@ -53,12 +60,14 @@ import {
   BACKLOG_TYPE_LABELS,
   BACKLOG_TYPES,
   EMPTY_BACKLOG_FILTERS,
+  backlogOfflineNotice,
   backlogScopeKey,
   backlogsSpanEnvironments,
+  boardHomeTargets,
   boardIssueKey,
   buildBacklogColumns,
   hasActiveBacklogFilters,
-  isBacklogSourceWritable,
+  isBacklogRefWritable,
   normalizeBacklogKeyInput,
   prunePendingBacklogMoves,
   type BacklogFilters,
@@ -71,7 +80,7 @@ import {
 } from "./backlog.logic";
 import { BacklogBoard } from "./BacklogBoard";
 import { BacklogGraph } from "./BacklogGraph";
-import { BacklogIssuePanel } from "./BacklogIssuePanel";
+import { BacklogIssuePanel, confirmAction } from "./BacklogIssuePanel";
 import { BacklogMessagesPanel } from "./BacklogMessagesPanel";
 import { BacklogInlineQuickAdd } from "./BacklogQuickAdd";
 import { useBacklogSwitcher } from "./useBacklogData";
@@ -222,6 +231,15 @@ export function BacklogPage({
     ? (sources.find((source) => source.environmentId === selected.environmentId) ?? null)
     : null;
   const singleBacklog = entry.backlogs.length === 1 ? entry.backlogs[0]! : null;
+  const sourceById = useMemo(
+    () => new Map(sources.map((source) => [source.environmentId, source] as const)),
+    [sources],
+  );
+  const timestampFormat = useClientSettings((settings) => settings.timestampFormat);
+  const formatAsOf = (iso: string) => formatDayAwareTimestamp(iso, timestampFormat);
+  const movedAway = entry.backlogs.flatMap((ref) =>
+    ref.backlog.movedTo === undefined ? [] : [{ ref, movedTo: ref.backlog.movedTo }],
+  );
 
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
@@ -245,14 +263,13 @@ export function BacklogPage({
                 }
               />
               {singleBacklog ? (
-                <BacklogKeyEditor
-                  backlogRef={singleBacklog}
-                  writable={scopeSources.some(
-                    (source) =>
-                      source.environmentId === singleBacklog.environmentId &&
-                      isBacklogSourceWritable(source),
-                  )}
-                />
+                <>
+                  <BacklogKeyEditor
+                    backlogRef={singleBacklog}
+                    writable={isBacklogRefWritable(singleBacklog, sourceById)}
+                  />
+                  <BacklogHomeMenu backlogRef={singleBacklog} sources={sources} />
+                </>
               ) : null}
             </WorkspaceBreadcrumbItem>
           </WorkspaceBreadcrumb>
@@ -337,7 +354,7 @@ export function BacklogPage({
                 {unhealthy.map((source) => (
                   <p key={source.environmentId} className="text-xs text-muted-foreground">
                     {source.status === "stale"
-                      ? `${source.label} is unreachable. Its issues show their last known state, read-only.`
+                      ? backlogOfflineNotice(source, formatAsOf)
                       : source.status === "error"
                         ? `Could not read the backlog on ${source.label}: ${source.error ?? "unknown error"}`
                         : `${source.label} is unavailable.`}
@@ -345,6 +362,16 @@ export function BacklogPage({
                 ))}
               </div>
             ) : null}
+            {movedAway.map(({ ref, movedTo }) => (
+              <p
+                key={`${ref.environmentId}:${ref.backlog.id}`}
+                className="px-5 text-xs text-muted-foreground sm:px-6"
+              >
+                {ref.backlog.key} moved to {movedTo.label}. This copy on{" "}
+                {sourceById.get(ref.environmentId)?.label ?? "its old machine"} is read-only;
+                connect to {movedTo.label} to work on it.
+              </p>
+            ))}
             {unsupportedLabels.length > 0 ? (
               <p className="px-5 text-xs text-muted-foreground sm:px-6">
                 {unsupportedLabels.join(", ")} {unsupportedLabels.length > 1 ? "don't" : "doesn't"}{" "}
@@ -578,6 +605,106 @@ function BacklogFilterMenu({
         <MenuCheckboxItem variant="switch" checked={showWontfix} onCheckedChange={onShowWontfix}>
           Show won't fix
         </MenuCheckboxItem>
+      </MenuPopup>
+    </Menu>
+  );
+}
+
+/**
+ * Moving a board's home to another connected machine, or bringing back a board whose move did
+ * not land. Every issue keeps its key and history.
+ */
+function BacklogHomeMenu({
+  backlogRef,
+  sources,
+}: {
+  backlogRef: BacklogRef;
+  sources: ReadonlyArray<BacklogSource>;
+}) {
+  const [pending, setPending] = useState(false);
+  const moveBacklog = useAtomCommand(backlogEnvironment.moveBacklog, {
+    label: "backlog move board",
+    reportFailure: false,
+  });
+  const restoreBacklog = useAtomCommand(backlogEnvironment.restoreBacklog, {
+    label: "backlog restore board",
+    reportFailure: false,
+  });
+  const targets = boardHomeTargets(backlogRef, sources);
+  const { backlog, environmentId } = backlogRef;
+  const home = sources.find((source) => source.environmentId === environmentId);
+  const restorable = backlog.movedTo !== undefined && home !== undefined && home.status === "live";
+  if (targets.length === 0 && !restorable) return null;
+
+  const run = async <A, E>(
+    confirmation: string,
+    action: () => Promise<AtomCommandResult<A, E>>,
+    done: string,
+    failed: string,
+  ) => {
+    if (!(await confirmAction(confirmation))) return;
+    setPending(true);
+    const result = await action();
+    setPending(false);
+    if (result._tag === "Success") {
+      toastManager.add({ type: "success", title: done });
+      return;
+    }
+    if (!isAtomCommandInterrupted(result)) {
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: failed,
+          description: backlogFailureMessage(result),
+        }),
+      );
+    }
+  };
+
+  return (
+    <Menu>
+      <MenuTrigger
+        aria-label={`${backlog.key} board actions`}
+        disabled={pending}
+        render={<Button variant="ghost-muted" size="icon-xs" />}
+      >
+        <EllipsisIcon aria-hidden />
+      </MenuTrigger>
+      <MenuPopup align="start">
+        {targets.map((target) => (
+          <MenuItem
+            key={target.environmentId}
+            onClick={() => {
+              void run(
+                `Move ${backlog.key} to ${target.label}? Its issues, numbers and history move with it, and this machine keeps a read-only copy that points there.`,
+                () =>
+                  moveBacklog({
+                    from: environmentId,
+                    backlogId: backlog.id,
+                    to: { environmentId: target.environmentId, label: target.label },
+                  }),
+                `Moved ${backlog.key} to ${target.label}`,
+                `Could not move ${backlog.key}`,
+              );
+            }}
+          >
+            Move board to {target.label}
+          </MenuItem>
+        ))}
+        {restorable ? (
+          <MenuItem
+            onClick={() => {
+              void run(
+                `Make ${backlog.key} live on ${home.label} again? Only do this if the board never arrived on ${backlog.movedTo?.label}; otherwise move it back from there.`,
+                () => restoreBacklog({ environmentId, input: { backlogId: backlog.id } }),
+                `${backlog.key} lives on ${home.label} again`,
+                `Could not restore ${backlog.key}`,
+              );
+            }}
+          >
+            Restore board on {home.label}
+          </MenuItem>
+        ) : null}
       </MenuPopup>
     </Menu>
   );

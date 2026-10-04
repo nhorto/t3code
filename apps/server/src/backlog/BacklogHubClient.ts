@@ -11,6 +11,7 @@
  */
 import * as NodeSocket from "@effect/platform-node/NodeSocket";
 import {
+  AgentMessageError,
   AuthAccessTokenType,
   AuthBacklogLinkScopes,
   AuthEnvironmentBootstrapTokenType,
@@ -24,6 +25,11 @@ import {
   ORCHESTRATION_PROTOCOL_VERSION,
   TrimmedNonEmptyString,
   WS_METHODS,
+  type AgentMessageAckInput,
+  type AgentMessageEnvelope,
+  type AgentMessageInboxEvent,
+  type AgentMessageRelayReceipt,
+  type AgentMessagesSubscribeInboxInput,
   type BacklogHubLinkStatus,
   type BacklogLinkHubInput,
   type BacklogRenewClaimsInput,
@@ -31,6 +37,7 @@ import {
 } from "@t3tools/contracts";
 import { encodeOAuthScope } from "@t3tools/shared/oauthScope";
 import { resolveRemotePairingTarget } from "@t3tools/shared/remote";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -38,11 +45,13 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
+import * as Stream from "effect/Stream";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpApiClient from "effect/unstable/httpapi/HttpApiClient";
 import * as RpcClient from "effect/unstable/rpc/RpcClient";
@@ -91,6 +100,8 @@ export class BacklogHubClient extends Context.Service<
     /** The hub's backlogs. Every call fails with code unavailable when there is no reachable hub. */
     readonly home: BacklogHome;
     readonly renewClaims: (input: BacklogRenewClaimsInput) => Effect.Effect<void, BacklogError>;
+    /** Signals each time a connection to the hub opens, including reconnects. */
+    readonly connections: () => Stream.Stream<void>;
     /** Link state; when linked, tries to reach the hub so the answer is current. */
     readonly status: () => Effect.Effect<BacklogHubLinkStatus>;
     /** Redeems a pairing URL minted on the hub and replaces any existing link. */
@@ -98,6 +109,17 @@ export class BacklogHubClient extends Context.Service<
       input: BacklogLinkHubInput,
     ) => Effect.Effect<BacklogHubLinkStatus, BacklogError>;
     readonly unlink: () => Effect.Effect<BacklogHubLinkStatus>;
+    /** The hub's agent message relay; see AgentMessageRelay. */
+    readonly relayAgentMessage: (
+      envelope: AgentMessageEnvelope,
+    ) => Effect.Effect<AgentMessageRelayReceipt, AgentMessageError | BacklogError>;
+    readonly ackAgentMessage: (
+      input: AgentMessageAckInput,
+    ) => Effect.Effect<void, AgentMessageError | BacklogError>;
+    /** Ends when the connection drops or the link changes; the caller reopens it. */
+    readonly agentMessageInbox: (
+      input: AgentMessagesSubscribeInboxInput,
+    ) => Stream.Stream<AgentMessageInboxEvent, BacklogError>;
   }
 >()("t3/backlog/BacklogHubClient") {}
 
@@ -106,7 +128,14 @@ export const unavailable = (reason: BacklogUnavailableReason, message: string) =
 
 const invalid = (message: string) => new BacklogError({ code: "invalid", message });
 
+const protocolMismatch = (label: string) =>
+  unavailable(
+    "protocol_mismatch",
+    `${label} runs a different T3 Code version that cannot answer this. Update both machines.`,
+  );
+
 const isBacklogError = Schema.is(BacklogError);
+const isAgentMessageError = Schema.is(AgentMessageError);
 
 const tagOf = (error: unknown): string =>
   typeof error === "object" && error !== null && "_tag" in error ? String(error._tag) : "";
@@ -123,6 +152,8 @@ interface Connection {
   readonly scope: Scope.Closeable;
   /** Set when the socket closes; the next call opens a new connection. */
   readonly lost: Ref.Ref<boolean>;
+  /** Completes when the connection is lost or closed, ending streams opened on it. */
+  readonly closed: Deferred.Deferred<void>;
 }
 
 interface ConnectionState {
@@ -152,6 +183,8 @@ export const make = Effect.gen(function* () {
   const stateRef = yield* Ref.make(IDLE);
   // One dial at a time; calls that arrive meanwhile share its result.
   const dialLock = yield* Semaphore.make(1);
+  /** One signal per connection opened to the hub. */
+  const connected = yield* PubSub.unbounded<void>();
 
   const apiFor = (httpBaseUrl: string) =>
     HttpApiClient.make(EnvironmentHttpApi, { baseUrl: httpBaseUrl }).pipe(
@@ -170,7 +203,26 @@ export const make = Effect.gen(function* () {
   };
 
   const closeConnection = (connection: Connection | null) =>
-    connection === null ? Effect.void : Scope.close(connection.scope, Exit.void);
+    connection === null
+      ? Effect.void
+      : Deferred.succeed(connection.closed, undefined).pipe(
+          Effect.andThen(Scope.close(connection.scope, Exit.void)),
+        );
+
+  /** Whether the hub refuses this build's orchestration protocol (HTTP 426 on /ws). */
+  const rejectsProtocol = (link: StoredHubLink) =>
+    Effect.gen(function* () {
+      const url = new URL("/ws", link.httpBaseUrl);
+      url.searchParams.set(
+        ORCHESTRATION_PROTOCOL_QUERY_PARAM,
+        String(ORCHESTRATION_PROTOCOL_VERSION),
+      );
+      const response = yield* httpClient.get(url);
+      return response.status === 426;
+    }).pipe(
+      Effect.timeoutOrElse({ duration: "3 seconds", orElse: () => Effect.succeed(false) }),
+      Effect.orElseSucceed(() => false),
+    );
 
   const dial = (link: StoredHubLink) =>
     Effect.gen(function* () {
@@ -191,9 +243,11 @@ export const make = Effect.gen(function* () {
       return yield* Effect.gen(function* () {
         const opened = yield* Deferred.make<void, BacklogError>();
         const lost = yield* Ref.make(false);
+        const closed = yield* Deferred.make<void>();
         const hooks = RpcClient.ConnectionHooks.of({
           onConnect: Deferred.succeed(opened, undefined).pipe(Effect.asVoid),
           onDisconnect: Ref.set(lost, true).pipe(
+            Effect.andThen(Deferred.succeed(closed, undefined)),
             Effect.andThen(
               Deferred.fail(
                 opened,
@@ -222,8 +276,17 @@ export const make = Effect.gen(function* () {
         );
         const context = yield* Layer.buildWithScope(protocol, scope);
         const client = yield* makeHubRpcClient.pipe(Effect.provide(context), Scope.provide(scope));
-        yield* Deferred.await(opened);
-        return { client, scope, lost } satisfies Connection;
+        yield* Deferred.await(opened).pipe(
+          // The hub answers an incompatible protocol with HTTP 426 instead of upgrading.
+          Effect.catch((error) =>
+            rejectsProtocol(link).pipe(
+              Effect.flatMap((rejected) =>
+                Effect.fail(rejected ? protocolMismatch(link.label) : error),
+              ),
+            ),
+          ),
+        );
+        return { client, scope, lost, closed } satisfies Connection;
       }).pipe(Effect.onError(() => Scope.close(scope, Exit.void)));
     }).pipe(
       Effect.timeoutOrElse({
@@ -235,37 +298,43 @@ export const make = Effect.gen(function* () {
 
   /** The open connection, dialing when there is none and the backoff allows. */
   const acquire = dialLock.withPermits(1)(
-    Effect.gen(function* () {
-      const link = yield* Ref.get(linkRef);
-      if (Option.isNone(link)) {
-        return yield* unavailable("not_linked", "This machine is not linked to a backlog hub.");
-      }
-      const state = yield* Ref.get(stateRef);
-      if (state.connection !== null && !(yield* Ref.get(state.connection.lost))) {
-        return state.connection;
-      }
-      yield* closeConnection(state.connection);
-      const nowMs = (yield* DateTime.now).epochMilliseconds;
-      if (state.error !== null && nowMs < state.retryAtMs) {
-        return yield* unavailable(state.error.reason, state.error.message);
-      }
-      const dialed = yield* Effect.exit(dial(link.value));
-      if (Exit.isSuccess(dialed)) {
-        yield* Ref.set(stateRef, { ...IDLE, connection: dialed.value });
-        return dialed.value;
-      }
-      const error = Exit.findErrorOption(dialed).pipe(
-        Option.getOrElse(() => unavailable("unreachable", `${link.value.label} is unreachable.`)),
-      );
-      const backoffMs = Math.min(MAX_RETRY_MS, Math.max(MIN_RETRY_MS, state.backoffMs * 2));
-      yield* Ref.set(stateRef, {
-        connection: null,
-        error: { reason: error.reason ?? "unreachable", message: error.message },
-        retryAtMs: nowMs + backoffMs,
-        backoffMs,
-      });
-      return yield* error;
-    }),
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* (): Effect.fn.Return<Connection, BacklogError> {
+        const link = yield* Ref.get(linkRef);
+        if (Option.isNone(link)) {
+          return yield* unavailable("not_linked", "This machine is not linked to a backlog hub.");
+        }
+        const state = yield* Ref.get(stateRef);
+        if (state.connection !== null && !(yield* Ref.get(state.connection.lost))) {
+          return state.connection;
+        }
+        yield* closeConnection(state.connection);
+        const nowMs = (yield* DateTime.now).epochMilliseconds;
+        if (state.error !== null && nowMs < state.retryAtMs) {
+          return yield* unavailable(state.error.reason, state.error.message);
+        }
+        // Only the dial may be interrupted; a connection it opened is always kept
+        // in state, so it is closed later rather than leaked with its pinger.
+        const dialed = yield* Effect.exit(restore(dial(link.value)));
+        if (Exit.isSuccess(dialed)) {
+          yield* Ref.set(stateRef, { ...IDLE, connection: dialed.value });
+          yield* PubSub.publish(connected, undefined);
+          return dialed.value;
+        }
+        if (Cause.hasInterrupts(dialed.cause)) return yield* Effect.failCause(dialed.cause);
+        const error = Exit.findErrorOption(dialed).pipe(
+          Option.getOrElse(() => unavailable("unreachable", `${link.value.label} is unreachable.`)),
+        );
+        const backoffMs = Math.min(MAX_RETRY_MS, Math.max(MIN_RETRY_MS, state.backoffMs * 2));
+        yield* Ref.set(stateRef, {
+          connection: null,
+          error: { reason: error.reason ?? "unreachable", message: error.message },
+          retryAtMs: nowMs + backoffMs,
+          backoffMs,
+        });
+        return yield* error;
+      }),
+    ),
   );
 
   /** Runs one RPC on the hub; anything but the hub's own BacklogError becomes unavailable. */
@@ -280,6 +349,7 @@ export const make = Effect.gen(function* () {
       });
       const markLost = (error: BacklogError) =>
         Ref.set(connection.lost, true).pipe(
+          Effect.andThen(Deferred.succeed(connection.closed, undefined)),
           Effect.andThen(
             Ref.update(stateRef, (state) => ({
               ...state,
@@ -289,6 +359,9 @@ export const make = Effect.gen(function* () {
           Effect.andThen(Effect.fail(error)),
         );
       return yield* run(connection.client).pipe(
+        // A hub on another build answers an RPC it does not know, or with a shape
+        // this build cannot decode, as a defect. The connection itself is fine.
+        Effect.catchDefect(() => Effect.fail(protocolMismatch(label))),
         Effect.timeoutOrElse({
           duration: REQUEST_TIMEOUT,
           orElse: () =>
@@ -330,6 +403,54 @@ export const make = Effect.gen(function* () {
     linkPullRequest: (input, actor) =>
       call((client) => client[WS_METHODS.backlogLinkPullRequest]({ ...input, actor })),
   };
+
+  /** The hub's own AgentMessageError is an answer, not a lost connection. */
+  const callRelay = <A, E>(
+    run: (client: HubRpcClient) => Effect.Effect<A, E>,
+  ): Effect.Effect<A, AgentMessageError | BacklogError> =>
+    call((client) =>
+      run(client).pipe(
+        Effect.map((value) => ({ ok: true as const, value })),
+        Effect.catchIf(isAgentMessageError, (error) =>
+          Effect.succeed({ ok: false as const, error }),
+        ),
+      ),
+    ).pipe(
+      Effect.flatMap((answer) =>
+        answer.ok ? Effect.succeed(answer.value) : Effect.fail(answer.error),
+      ),
+    );
+
+  const relayAgentMessage: BacklogHubClient["Service"]["relayAgentMessage"] = (envelope) =>
+    callRelay((client) => client[WS_METHODS.agentMessagesRelay](envelope));
+  const ackAgentMessage: BacklogHubClient["Service"]["ackAgentMessage"] = (input) =>
+    callRelay((client) => client[WS_METHODS.agentMessagesAck](input));
+  const agentMessageInbox: BacklogHubClient["Service"]["agentMessageInbox"] = (input) =>
+    Stream.unwrap(
+      Effect.gen(function* () {
+        const connection = yield* acquire;
+        const label = Option.match(yield* Ref.get(linkRef), {
+          onNone: () => "The backlog hub",
+          onSome: (link) => link.label,
+        });
+        return connection.client[WS_METHODS.agentMessagesSubscribeInbox](input).pipe(
+          Stream.interruptWhen(Deferred.await(connection.closed)),
+          Stream.catchDefect(() => Stream.fail(protocolMismatch(label))),
+          Stream.catch((error) =>
+            isBacklogError(error)
+              ? Stream.fail(error)
+              : Stream.fromEffect(
+                  Ref.set(connection.lost, true).pipe(
+                    Effect.andThen(Deferred.succeed(connection.closed, undefined)),
+                    Effect.andThen(
+                      Effect.fail(unavailable("unreachable", `Lost the connection to ${label}.`)),
+                    ),
+                  ),
+                ),
+          ),
+        );
+      }),
+    );
 
   const status: BacklogHubClient["Service"]["status"] = () =>
     Effect.gen(function* () {
@@ -439,9 +560,15 @@ export const make = Effect.gen(function* () {
         linkedAt: DateTime.formatIso(now),
         expiresAt: DateTime.formatIso(DateTime.add(now, { seconds: token.expires_in })),
       };
-      yield* secrets
-        .set(HUB_LINK_SECRET, new TextEncoder().encode(encodeStoredHubLink(next)))
-        .pipe(Effect.orDie);
+      yield* secrets.set(HUB_LINK_SECRET, new TextEncoder().encode(encodeStoredHubLink(next))).pipe(
+        Effect.mapError(
+          () =>
+            new BacklogError({
+              code: "unavailable",
+              message: "Could not save the hub link on this machine. Check its state directory.",
+            }),
+        ),
+      );
       yield* replaceLink(Option.some(next));
       return yield* status();
     });
@@ -465,9 +592,13 @@ export const make = Effect.gen(function* () {
     ),
     home,
     renewClaims: (input) => call((client) => client[WS_METHODS.backlogRenewClaims](input)),
+    connections: () => Stream.fromPubSub(connected),
     status,
     link,
     unlink,
+    relayAgentMessage,
+    ackAgentMessage,
+    agentMessageInbox,
   });
 });
 
@@ -493,16 +624,12 @@ export const renewHubLeasesForever = Effect.gen(function* () {
     if (threadIds.length === 0) return;
     yield* hub.renewClaims({ environmentId, threadIds });
   });
-  return yield* Effect.sleep(HUB_LEASE_RENEW_INTERVAL).pipe(
-    Effect.andThen(
-      renewOnce.pipe(
-        Effect.catchCause((cause) =>
-          Effect.logWarning("Backlog hub lease renewal failed", { cause }),
-        ),
-      ),
-    ),
-    Effect.forever,
+  const renew = renewOnce.pipe(
+    Effect.catchCause((cause) => Effect.logWarning("Backlog hub lease renewal failed", { cause })),
   );
+  // After a reconnect, leases that ran low while the hub was away are renewed at once.
+  yield* Stream.runForEach(hub.connections(), () => renew).pipe(Effect.forkChild);
+  return yield* Effect.sleep(HUB_LEASE_RENEW_INTERVAL).pipe(Effect.andThen(renew), Effect.forever);
 });
 
 export const renewalLayer = Layer.effectDiscard(forkParked(renewHubLeasesForever));

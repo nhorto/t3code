@@ -65,7 +65,7 @@ const STATUS_OPTIONS: ReadonlyArray<BacklogIssueStatus> = [
 ];
 
 /** The themed confirm where the app shell hosts one, else the browser's. */
-async function confirmAction(message: string): Promise<boolean> {
+export async function confirmAction(message: string): Promise<boolean> {
   const api = readLocalApi();
   return api ? api.dialogs.confirm(message) : window.confirm(message);
 }
@@ -229,9 +229,11 @@ function IssueDetailBody({
   const navigate = useNavigate();
   const projects = useProjects();
   const commands = useIssueCommands(environmentId);
-  const writable = source !== null && isBacklogSourceWritable(source);
   const board = source?.board ?? null;
   const backlog = board?.backlogs.find((candidate) => candidate.id === issue.backlogId) ?? null;
+  // A board that moved to another machine leaves this copy read-only.
+  const writable =
+    source !== null && isBacklogSourceWritable(source) && backlog?.movedTo === undefined;
   const closed = isBacklogStatusClosed(issue.status);
   const [editingBody, setEditingBody] = useState(false);
   const [bodyDraft, setBodyDraft] = useState("");
@@ -313,7 +315,9 @@ function IssueDetailBody({
     <div className="flex flex-col gap-5 p-4">
       {!writable ? (
         <p className="rounded-lg border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-          {source?.label ?? "This machine"} is unreachable. Showing the last known state, read-only.
+          {backlog?.movedTo !== undefined
+            ? `${backlog.key} moved to ${backlog.movedTo.label}. This copy is read-only.`
+            : `${source?.label ?? "This machine"} is unreachable. Showing the last known state; changes are disabled.`}
         </p>
       ) : null}
 

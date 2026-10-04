@@ -15,6 +15,7 @@ import * as Stream from "effect/Stream";
 
 import type { BacklogHome } from "../../../backlog/BacklogHome.ts";
 import * as BacklogHubClient from "../../../backlog/BacklogHubClient.ts";
+import * as BacklogHubSnapshot from "../../../backlog/BacklogHubSnapshot.ts";
 import * as BacklogRouter from "../../../backlog/BacklogRouter.ts";
 import * as BacklogService from "../../../backlog/BacklogService.ts";
 import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
@@ -52,6 +53,7 @@ const services = BacklogRouter.layer.pipe(
   Layer.provideMerge(
     Layer.mergeAll(
       NodeCrypto.layer,
+      BacklogHubSnapshot.layer,
       // Not linked to a hub: every call stays on this machine.
       Layer.mock(BacklogHubClient.BacklogHubClient)({
         linkedHub: Effect.succeed(Option.none()),

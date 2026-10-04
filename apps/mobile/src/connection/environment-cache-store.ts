@@ -46,6 +46,9 @@ const decodeStoredServerConfig = Schema.decodeUnknownEffect(
 );
 const encodeStoredServerConfig = Schema.encodeEffect(Schema.fromJsonString(StoredServerConfig));
 const decodeStoredVcsRefs = Schema.decodeUnknownEffect(Schema.fromJsonString(StoredVcsRefs));
+const StoredBacklogBoardJson = Schema.fromJsonString(Persistence.StoredBacklogBoard);
+const decodeStoredBacklogBoard = Schema.decodeUnknownEffect(StoredBacklogBoardJson);
+const encodeStoredBacklogBoard = Schema.encodeEffect(StoredBacklogBoardJson);
 const encodeStoredVcsRefs = Schema.encodeEffect(Schema.fromJsonString(StoredVcsRefs));
 
 type CacheOperation = Persistence.ConnectionPersistenceError["operation"];
@@ -233,3 +236,35 @@ export const make = Effect.fn("MobileEnvironmentCacheStore.make")(function* () {
 });
 
 export const layer = Layer.effect(Persistence.EnvironmentCacheStore, make());
+
+/** Each environment's last backlog board, shown read-only while it is out of reach. */
+export const makeBacklogBoardStore = Effect.fn("MobileBacklogBoardCacheStore.make")(function* () {
+  const database = yield* MobileDatabase.MobileDatabase;
+  return {
+    load: (environmentId) =>
+      loadDecodedCache({
+        database,
+        environmentId,
+        kind: "backlog-board",
+        cacheKey: "board",
+        operation: "load-backlog-board",
+        decode: decodeStoredBacklogBoard,
+        select: (stored) =>
+          stored.environmentId === environmentId ? Option.some(stored) : Option.none(),
+      }),
+    save: (board) =>
+      encodeStoredBacklogBoard(board).pipe(
+        Effect.mapError((cause) => persistenceError("save-backlog-board", cause)),
+        Effect.flatMap((payload) =>
+          database
+            .saveCache(board.environmentId, "backlog-board", "board", board.schemaVersion, payload)
+            .pipe(Effect.mapError(mapDatabaseError("save-backlog-board"))),
+        ),
+      ),
+  } satisfies Persistence.BacklogBoardCacheStoreShape;
+});
+
+export const backlogBoardLayer = Layer.effect(
+  Persistence.BacklogBoardCacheStore,
+  makeBacklogBoardStore(),
+);

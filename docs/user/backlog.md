@@ -45,20 +45,31 @@ that are unblocked.
 
 ## Agents messaging each other
 
-Agents can message other agents' threads on the same machine, in any project and with any
-provider: to ask the agent holding an issue a question, to tell a waiting chat that its dependency
-is done, or to tell everyone working a spec about a change. The receiver wakes up if it is idle;
-a busy one gets the message as its next turn, unless the sender marked it urgent. The message shows
-in the receiver's chat with a link to the sender, and the reply comes back the same way.
+Agents can message other agents' threads in any project and with any provider: to ask the agent
+holding an issue a question, to tell a waiting chat that its dependency is done, or to tell everyone
+working a spec about a change. The receiver wakes up if it is idle; a busy one gets the message as
+its next turn, unless the sender marked it urgent. The message shows in the receiver's chat with a
+link to the sender, and the reply comes back the same way.
+
+This works across machines linked to the same hub (see below): an agent on one machine can message
+the holder of an issue whose thread runs on another. Messages travel through the hub. A message for
+a machine that is offline waits at the hub and is delivered when that machine comes back; after 24
+hours it is reported as undeliverable instead.
 
 Choose **Messages** on the Backlog to see every agent message. To stop two agents looping, a
 thread accepts at most 10 agent messages an hour. Further messages are **held**: the Backlog
-sidebar button shows how many, and you can **Release** or **Dismiss** each one. Sending your own
-message to that thread also lets its held messages through.
+sidebar button shows how many, and you can **Release** or **Dismiss** each one from the machine
+the receiving thread runs on. Sending your own message to that thread also lets its held messages
+through. A thread holds at most 50 messages; beyond that, senders are told to wait.
 
 ## Where the data lives
 
 A board lives on one machine. Every client connected to that machine sees it live.
+
+When that machine is out of reach, say on a plane, the Backlog keeps showing its board as it was
+when you last saw it, on web, desktop and mobile, even after a restart. A notice says whose board
+it is and how old; changes are disabled until the machine is back. Issues closed more than 30 days
+ago are left out of this offline copy.
 
 To let agents on several machines work the same boards, pick an always-on machine as the **hub**
 and link the others to it:
@@ -69,6 +80,21 @@ and link the others to it:
 
 Agents on a linked machine then find, claim and update the hub's issues as if they were local, and
 new project boards and Inbox ideas from their chats go to the hub. A board that already exists on
-the linked machine stays there. If the hub is unreachable, agents are told so rather than working
-from a stale copy. The link reaches only backlogs and lasts a year; unlink it from
-**Settings → Backlog**, or revoke it on the hub under **Settings → Connections**.
+the linked machine stays there. If the hub is unreachable, agents can still read what it last
+reported, marked as possibly out of date, but cannot change anything on it until it is back. The link reaches only backlogs and lasts a year; unlink it from
+**Settings → Backlog**. Unlinking does not end the session on the hub; revoke it there under
+**Settings → Connections**.
+
+### Moving a board
+
+To move a project's board to another machine, for example onto the always-on hub, open the board
+on web or desktop and choose **Move board to** that machine from the menu next to its key. Both
+machines must be connected, nothing on the board may be claimed (release claimed issues first), and
+the other machine must not already have a board for the project. Moving needs the permission to
+manage **Settings → Connections** on both machines. Issues keep their keys, numbers, dependencies
+and history.
+
+The old machine keeps a read-only copy that says where the board went, and agents there are pointed
+to the new machine. If a move fails partway, the board stays where it was; if the app closed
+mid-move and the board never arrived, choose **Restore board** from the old copy's menu. To move it
+back, move it again from its new home.

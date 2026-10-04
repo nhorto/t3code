@@ -11,16 +11,17 @@ export const AgentMessageHandlersLive = AgentMessageToolkit.toLayer({
       const { scope, caller } = yield* readCaller();
       const target: AgentMessageService.AgentMessageTarget | null =
         input.threadId !== undefined && input.issue === undefined && input.spec === undefined
-          ? { type: "thread", threadId: input.threadId }
+          ? { type: "thread", threadId: input.threadId, environmentId: input.environmentId }
           : input.issue !== undefined && input.threadId === undefined && input.spec === undefined
             ? { type: "issue", issue: input.issue }
             : input.spec !== undefined && input.threadId === undefined && input.issue === undefined
               ? { type: "spec", issue: input.spec }
               : null;
-      if (target === null) {
+      if (target === null || (input.environmentId !== undefined && target.type !== "thread")) {
         return yield* new AgentMessageError({
           code: "invalid",
-          message: "Give exactly one of threadId, issue, or spec.",
+          message:
+            "Give exactly one of threadId, issue, or spec; environmentId only goes with threadId.",
         });
       }
       const service = yield* AgentMessageService.AgentMessageService;
@@ -31,11 +32,13 @@ export const AgentMessageHandlersLive = AgentMessageToolkit.toLayer({
           threadId: scope.threadId,
           label: `${caller.title} · ${caller.modelSelection.model}`,
           runtimeMode: caller.runtimeMode,
+          interactionMode: caller.interactionMode,
         },
       );
       return {
         messages: outcomes.map(({ message, delivery }) => ({
           id: message.id,
+          environmentId: message.to.environmentId,
           threadId: message.to.threadId,
           threadTitle: message.to.label,
           status: message.status,

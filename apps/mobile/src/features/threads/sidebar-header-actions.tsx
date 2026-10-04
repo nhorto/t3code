@@ -4,12 +4,14 @@ import { Pressable, View } from "react-native";
 export interface SidebarHeaderActionsProps {
   readonly onOpenSettings: () => void;
   readonly onOpenBacklog: () => void;
+  readonly heldMessageCount?: number;
 }
 
 function FallbackHeaderButton(props: {
   readonly accessibilityLabel: string;
   readonly icon: "checklist" | "gearshape" | "square.and.pencil";
   readonly onPress: () => void;
+  readonly badge?: boolean;
 }) {
   return (
     <Pressable
@@ -25,6 +27,12 @@ function FallbackHeaderButton(props: {
         tintColorClassName="accent-foreground"
         type="monochrome"
       />
+      {props.badge ? (
+        <View
+          pointerEvents="none"
+          className="absolute top-2 right-2 size-2.5 rounded-full bg-warning"
+        />
+      ) : null}
     </Pressable>
   );
 }
@@ -33,9 +41,14 @@ export function SidebarHeaderActions(props: SidebarHeaderActionsProps) {
   return (
     <View className="flex-row items-center gap-0.5">
       <FallbackHeaderButton
-        accessibilityLabel="Open backlog"
+        accessibilityLabel={
+          (props.heldMessageCount ?? 0) > 0
+            ? `Open backlog, ${props.heldMessageCount} messages held`
+            : "Open backlog"
+        }
         icon="checklist"
         onPress={props.onOpenBacklog}
+        badge={(props.heldMessageCount ?? 0) > 0}
       />
       <FallbackHeaderButton
         accessibilityLabel="Open settings"

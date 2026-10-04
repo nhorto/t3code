@@ -76,6 +76,11 @@ export function createAgentMessageEnvironmentAtoms<R, E>(
           Stream.drop(1),
         ),
     }),
+    /** Held messages only, for badges; much lighter than the feed. */
+    heldCount: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
+      label: "environment-data:agent-messages:held-count",
+      tag: WS_METHODS.agentMessagesSubscribeHeldCount,
+    }),
     release: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:agent-messages:release",
       tag: WS_METHODS.agentMessagesRelease,

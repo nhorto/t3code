@@ -128,13 +128,15 @@ function EnvironmentHubLinkRow(props: {
       ? query.failure._tag
       : null;
   const description =
-    status !== null
-      ? describeHubLink(status)
-      : failureTag === "EnvironmentAuthorizationError"
-        ? "Linking needs administrator access to this machine."
-        : query.error !== null && /Unknown request tag/.test(query.error)
-          ? "This machine runs a T3 Code without backlog links."
-          : (query.error ?? "Checking…");
+    status !== null && confirmingUnlink
+      ? "Unlinking stops this machine using the hub. The hub keeps this machine's session until you revoke it in the hub's Settings → Connections."
+      : status !== null
+        ? describeHubLink(status)
+        : failureTag === "EnvironmentAuthorizationError"
+          ? "Linking needs administrator access to this machine."
+          : query.error !== null && /Unknown request tag/.test(query.error)
+            ? "This machine runs a T3 Code without backlog links."
+            : (query.error ?? "Checking…");
 
   return (
     <SettingsRow

@@ -23,7 +23,9 @@ import {
   selectBacklogScopeIssues,
   type BacklogListItem,
 } from "./backlog.logic";
+import { heldAgentMessagesSummary } from "./agentMessages.logic";
 import { BacklogIssueRow, BacklogSectionHeader } from "./backlog-components";
+import { useHeldAgentMessageCount } from "./useAgentMessages";
 import { useBacklogBoards, type BacklogEnvironmentNotice } from "./useBacklogBoards";
 
 export type BacklogRouteParams = {
@@ -47,6 +49,8 @@ export function BacklogRouteScreen({ route }: StaticScreenProps<BacklogRoutePara
     environmentLabel,
     isLoading,
   } = useBacklogBoards();
+  const heldMessageCount = useHeldAgentMessageCount();
+  const openMessages = useCallback(() => navigation.navigate("BacklogMessages"), [navigation]);
   const [selectedScopeKey, setSelectedScopeKey] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState<BacklogIssueType | null>(null);
@@ -172,6 +176,12 @@ export function BacklogRouteScreen({ route }: StaticScreenProps<BacklogRoutePara
         ]}
         actions={[
           {
+            accessibilityLabel:
+              heldMessageCount > 0 ? `Agent messages, ${heldMessageCount} held` : "Agent messages",
+            icon: "text.bubble",
+            onPress: openMessages,
+          },
+          {
             accessibilityLabel: "Add to backlog",
             icon: "plus",
             onPress: openQuickAdd,
@@ -199,6 +209,8 @@ export function BacklogRouteScreen({ route }: StaticScreenProps<BacklogRoutePara
               notices={notices}
               unsupportedLabels={unsupportedLabels}
               loadingMore={isLoading && boards.length > 0}
+              heldMessageCount={heldMessageCount}
+              onOpenMessages={openMessages}
               onSelectScope={setSelectedScopeKey}
             />
           }
@@ -217,6 +229,8 @@ function BacklogBoardHeader(props: {
   readonly notices: ReadonlyArray<BacklogEnvironmentNotice>;
   readonly unsupportedLabels: ReadonlyArray<string>;
   readonly loadingMore: boolean;
+  readonly heldMessageCount: number;
+  readonly onOpenMessages: () => void;
   readonly onSelectScope: (key: string) => void;
 }) {
   return (
@@ -251,6 +265,33 @@ function BacklogBoardHeader(props: {
           />
         </Pressable>
       </ControlPillMenu>
+      {props.heldMessageCount > 0 ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`${heldAgentMessagesSummary(props.heldMessageCount)}. Open messages`}
+          onPress={props.onOpenMessages}
+          className="flex-row items-center gap-2 rounded-[16px] bg-warning px-3 py-2 active:opacity-70"
+        >
+          <SymbolView
+            name="text.bubble"
+            size={13}
+            tintColorClassName="accent-warning-foreground"
+            type="monochrome"
+          />
+          <Text
+            className="min-w-0 flex-1 text-xs font-t3-bold text-warning-foreground"
+            numberOfLines={1}
+          >
+            {heldAgentMessagesSummary(props.heldMessageCount)}
+          </Text>
+          <SymbolView
+            name="chevron.right"
+            size={12}
+            tintColorClassName="accent-warning-foreground"
+            type="monochrome"
+          />
+        </Pressable>
+      ) : null}
       {props.notices.map((notice) => (
         <View
           key={notice.environmentId}

@@ -41,7 +41,10 @@ export function createSidebarHeaderItems(input: {
   readonly filterMenu: HomeListFilterMenu;
   readonly onOpenSettings: () => void;
   readonly onOpenBacklog: () => void;
+  /** Agent messages held for the user; badges the backlog button (iOS 26+). */
+  readonly heldMessageCount?: number;
 }): NativeStackHeaderItem[] {
+  const held = input.heldMessageCount ?? 0;
   return [
     withNativeGlassHeaderItem({
       type: "menu",
@@ -56,9 +59,10 @@ export function createSidebarHeaderItems(input: {
     withNativeGlassHeaderItem({
       type: "button",
       label: "",
-      accessibilityLabel: "Open backlog",
+      accessibilityLabel: held > 0 ? `Open backlog, ${held} messages held` : "Open backlog",
       icon: sfSymbolIcon("checklist"),
       onPress: input.onOpenBacklog,
+      ...(held > 0 ? { badge: { value: held } } : {}),
     }),
     withNativeGlassHeaderItem({
       type: "button",

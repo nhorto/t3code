@@ -15,6 +15,7 @@ import { MaterialFloatingActionButton } from "../../components/MaterialFloatingA
 import { AndroidAnchoredMenu } from "../../components/AndroidAnchoredMenu";
 import { ControlPillMenu } from "../../components/ControlPill";
 import { MaterialSearchField } from "../../components/MaterialSearchField";
+import { useHeldAgentMessageCount } from "../backlog/useAgentMessages";
 import { useHardwareKeyboardCommand } from "../keyboard/hardwareKeyboardCommands";
 import { WorkspaceConnectionTitle } from "./WorkspaceConnectionTitle";
 import { useWorkspaceState } from "../../state/workspace";
@@ -39,6 +40,7 @@ export function MaterialThreadListToolbar(props: {
   const { fabSize } = useAndroidControlSizing();
   const { height: toolbarHeight, ...headerPadding } = useMaterialToolbarLayout();
   const { state } = useWorkspaceState();
+  const heldMessageCount = useHeldAgentMessageCount();
   const { onRequestVisibility, onSearchQueryChange } = props;
   const searchRef = useRef<TextInputInstance>(null);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -115,11 +117,23 @@ export function MaterialThreadListToolbar(props: {
                 onPress={openSearch}
               />
               {props.onOpenBacklog ? (
-                <AndroidHeaderIconButton
-                  accessibilityLabel="Open backlog"
-                  icon="checklist"
-                  onPress={props.onOpenBacklog}
-                />
+                <View>
+                  <AndroidHeaderIconButton
+                    accessibilityLabel={
+                      heldMessageCount > 0
+                        ? `Open backlog, ${heldMessageCount} messages held`
+                        : "Open backlog"
+                    }
+                    icon="checklist"
+                    onPress={props.onOpenBacklog}
+                  />
+                  {heldMessageCount > 0 ? (
+                    <View
+                      pointerEvents="none"
+                      className="absolute top-2.5 right-2.5 size-2.5 rounded-full bg-warning"
+                    />
+                  ) : null}
+                </View>
               ) : null}
               <AndroidHeaderIconButton
                 accessibilityLabel="Open settings"

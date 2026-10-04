@@ -17,6 +17,7 @@ import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import { localBacklogHome, type BacklogHome } from "./BacklogHome.ts";
 import * as BacklogHubClient from "./BacklogHubClient.ts";
+import * as BacklogHubSnapshot from "./BacklogHubSnapshot.ts";
 import { BacklogRouter, layer as routerLayer } from "./BacklogRouter.ts";
 import { BacklogService, layer as serviceLayer } from "./BacklogService.ts";
 
@@ -94,14 +95,25 @@ const unreachable: BacklogHome = (() => {
 
 /**
  * A spoke linked to a hub. The fake hub client serves a second, real backlog
- * service, which is exactly what the hub's RPC handlers call.
+ * service, which is exactly what the hub's RPC handlers call. `setHubUp`
+ * takes the hub off the network and back.
  */
 const fleet = (hubState: "up" | "down" | "not_linked") =>
   Effect.gen(function* () {
     const hub = Context.get(yield* Layer.build(backlogService({})), BacklogService);
+    let hubUp = hubState === "up";
+    const hubHome = localBacklogHome(hub);
+    const switchable = Object.fromEntries(
+      Object.keys(hubHome).map((name) => [
+        name,
+        (...args: ReadonlyArray<unknown>) =>
+          ((hubUp ? hubHome : unreachable) as unknown as Record<string, Function>)[name]!(...args),
+      ]),
+    ) as unknown as BacklogHome;
     const spokeContext = yield* Layer.build(
       routerLayer.pipe(
         Layer.provideMerge(backlogService(spokeProjects)),
+        Layer.provideMerge(BacklogHubSnapshot.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
         Layer.provideMerge(
           Layer.mock(ProjectService.ProjectService)({
             getShell: (projectId) => Effect.succeed(projectShell(spokeProjects, projectId)),
@@ -117,7 +129,7 @@ const fleet = (hubState: "up" | "down" | "not_linked") =>
                     label: "Geekom",
                   }),
             ),
-            home: hubState === "down" ? unreachable : localBacklogHome(hub),
+            home: switchable,
           }),
         ),
       ),
@@ -126,6 +138,9 @@ const fleet = (hubState: "up" | "down" | "not_linked") =>
       router: Context.get(spokeContext, BacklogRouter),
       local: Context.get(spokeContext, BacklogService),
       hub,
+      setHubUp: (up: boolean) => {
+        hubUp = up;
+      },
     };
   });
 
@@ -251,5 +266,111 @@ it.effect("keeps everything on this machine when it has no hub", () =>
     assert.equal(missing.code, "not_found");
     const listed = yield* router.listIssues({});
     assert.isNull(listed.hub);
+  }).pipe(Effect.scoped),
+);
+
+it.effect("answers reads from the hub's last snapshot while it is down, marked stale", () =>
+  Effect.gen(function* () {
+    const { router, hub, setHubUp } = yield* fleet("up");
+    const spec = yield* hub.createIssue({ title: "Spec", body: "The plan" }, hubUser);
+    yield* hub.createIssue({ title: "Quick idea" }, hubUser);
+    const live = yield* router.listIssues({});
+    assert.isUndefined(live.stale);
+    yield* router.getIssue(spec.key);
+
+    setHubUp(false);
+    const listed = yield* router.listIssues({});
+    assert.deepEqual(
+      listed.issues.map((issue) => [issue.title, issue.host]),
+      [
+        ["Spec", "hub"],
+        ["Quick idea", "hub"],
+      ],
+    );
+    assert.isTrue(listed.stale);
+    assert.isString(listed.asOf);
+    assert.equal(listed.hub?.state, "unavailable");
+
+    const detail = yield* router.getIssue(spec.key);
+    assert.equal(detail.body, "The plan");
+    assert.isTrue(detail.stale);
+    // A body never read cannot be made up; a row without one is answered whole.
+    const idea = yield* router.getIssue("INBOX-2");
+    assert.equal(idea.issue.title, "Quick idea");
+    assert.isTrue(idea.stale);
+
+    const write = yield* router
+      .comment({ issue: spec.key, text: "Still here?" }, agent)
+      .pipe(Effect.flip);
+    assert.equal(write.code, "unavailable");
+
+    setHubUp(true);
+    assert.isUndefined((yield* router.listIssues({})).stale);
+  }).pipe(Effect.scoped),
+);
+
+it.effect("follows a backlog that moved from this machine to the hub", () =>
+  Effect.gen(function* () {
+    const { router, local, hub } = yield* fleet("up");
+    const backlog = yield* local.ensureProjectBacklog(corkAndNote);
+    yield* local.createIssue({ backlogId: backlog.id, title: "Paywall", status: "ready" }, hubUser);
+    const exported = yield* local.exportBacklog({
+      backlogId: backlog.id,
+      to: { environmentId: EnvironmentId.make("environment-geekom"), label: "Geekom" },
+    });
+    yield* hub.importBacklog(exported);
+
+    const claimed = yield* router.claim("CN-1", agent);
+    assert.equal(claimed.issue.status, "in_progress");
+    assert.equal(
+      (yield* hub.getIssue({ issueId: claimed.issue.id })).issue.claim?.actor.label,
+      agent.label,
+    );
+    const next = yield* router.createIssue({ projectId: corkAndNote, title: "Receipts" }, agent);
+    assert.equal(next.key, "CN-2");
+    assert.equal((yield* hub.getIssue({ issueId: next.id })).issue.key, "CN-2");
+  }).pipe(Effect.scoped),
+);
+
+it.effect("names where a backlog went when it moved somewhere this machine cannot follow", () =>
+  Effect.gen(function* () {
+    const { router, local } = yield* fleet("not_linked");
+    const backlog = yield* local.ensureProjectBacklog(corkAndNote);
+    yield* local.createIssue({ backlogId: backlog.id, title: "Paywall" }, hubUser);
+    yield* local.exportBacklog({
+      backlogId: backlog.id,
+      to: { environmentId: EnvironmentId.make("environment-ex"), label: "EX" },
+    });
+    const read = yield* router.getIssue("CN-1").pipe(Effect.flip);
+    assert.equal(read.code, "conflict");
+    assert.include(read.message, "moved to EX");
+    const write = yield* router
+      .createIssue({ projectId: corkAndNote, title: "More" }, agent)
+      .pipe(Effect.flip);
+    assert.include(write.message, "moved to EX");
+  }).pipe(Effect.scoped),
+);
+
+it.effect("refuses a key both machines use, and says which machine answered", () =>
+  Effect.gen(function* () {
+    const { router, local, hub } = yield* fleet("up");
+    const here = yield* local.createIssue({ title: "Here", status: "ready" }, hubUser);
+    const there = yield* hub.createIssue({ title: "There", status: "ready" }, hubUser);
+    assert.deepEqual([here.key, there.key], ["INBOX-1", "INBOX-1"]);
+
+    const ambiguous = yield* router.getIssue("inbox-1").pipe(Effect.flip);
+    assert.equal(ambiguous.code, "invalid");
+    assert.include(ambiguous.message, here.id);
+    assert.include(ambiguous.message, there.id);
+    assert.include(ambiguous.message, "Geekom");
+    assert.equal(
+      (yield* router.listIssues({ backlog: "INBOX" }).pipe(Effect.flip)).code,
+      "invalid",
+    );
+
+    const read = yield* router.getIssue(there.id);
+    assert.deepEqual([read.host, read.machine], ["hub", "Geekom"]);
+    const claimed = yield* router.claim(here.id, agent);
+    assert.deepEqual([claimed.host, claimed.machine], ["local", "this machine"]);
   }).pipe(Effect.scoped),
 );

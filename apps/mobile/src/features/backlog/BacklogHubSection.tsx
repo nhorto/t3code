@@ -49,7 +49,7 @@ export function BacklogHubSection({ environmentId }: { readonly environmentId: E
           onPress={() =>
             Alert.alert(
               `Unlink ${hub.label}?`,
-              "Agents here lose access to its backlogs. Linking again needs a new pairing URL from the hub.",
+              "Agents here lose access to its backlogs. Linking again needs a new pairing URL from the hub. The hub keeps this machine's session until you revoke it in the hub's Settings → Connections.",
               [
                 { text: "Cancel", style: "cancel" },
                 {

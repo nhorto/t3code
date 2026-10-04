@@ -40,6 +40,7 @@ import {
   creatableProjectIdsOn,
   describeBacklogActivity,
   describeBacklogClaim,
+  backlogReadOnlyReason,
   findBacklog,
   reopenBacklogStatus,
 } from "./backlog.logic";
@@ -98,9 +99,8 @@ function BacklogIssueScreen(props: {
     (id: EnvironmentId) => environments.find((entry) => entry.environmentId === id)?.label ?? null,
     [environments],
   );
-  const board = useEnvironmentQuery(
-    connected ? backlogEnvironment.board({ environmentId, input: {} }) : null,
-  );
+  // The board shows this device's saved copy while the environment is out of reach.
+  const board = useEnvironmentQuery(backlogEnvironment.board({ environmentId, input: {} }));
   const detail = useEnvironmentQuery(
     connected ? backlogEnvironment.issueDetail({ environmentId, input: { issueId } }) : null,
   );
@@ -139,7 +139,14 @@ function BacklogIssueScreen(props: {
     issue && board.data
       ? backlogMoveTargets(board.data, issue, environmentProjects, creatableProjectIds)
       : [];
-  const disabled = pending || !connected || issue === null;
+  const readOnlyReason = backlogReadOnlyReason({
+    connected,
+    board: board.data ?? null,
+    backlog,
+    label: environment?.label ?? "This environment",
+    formatTime: (iso) => `${relativeTime(iso)} ago`,
+  });
+  const disabled = pending || readOnlyReason !== null || issue === null;
   const refreshDetail = detail.refresh;
 
   const runUpdate = async (
@@ -282,11 +289,8 @@ function BacklogIssueScreen(props: {
           contentContainerClassName="gap-5 px-4 pt-4 pb-6"
           showsVerticalScrollIndicator={false}
         >
-          {!connected ? (
-            <Text className="px-1 text-sm text-danger-foreground">
-              {environment?.label ?? "This environment"} is disconnected. Changes are paused until
-              it reconnects.
-            </Text>
+          {readOnlyReason !== null ? (
+            <Text className="px-1 text-sm text-danger-foreground">{readOnlyReason}</Text>
           ) : null}
 
           <View className="gap-2 px-1">

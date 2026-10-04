@@ -11,6 +11,9 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as PubSub from "effect/PubSub";
+import * as Queue from "effect/Queue";
+import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -37,6 +40,8 @@ it.effect(
   () =>
     Effect.gen(function* () {
       const renewals: Array<BacklogRenewClaimsInput> = [];
+      const connections = yield* PubSub.unbounded<void>();
+      const renewed = yield* Queue.unbounded<BacklogRenewClaimsInput>();
       let linked = true;
       const layer = Layer.mergeAll(
         Layer.mock(BacklogHubClient.BacklogHubClient)({
@@ -49,7 +54,12 @@ it.effect(
               : Option.none(),
           ),
           home: {} as BacklogHubClient.BacklogHubClient["Service"]["home"],
-          renewClaims: (input) => Effect.sync(() => void renewals.push(input)),
+          renewClaims: (input) =>
+            Effect.sync(() => void renewals.push(input)).pipe(
+              Effect.andThen(Queue.offer(renewed, input)),
+              Effect.asVoid,
+            ),
+          connections: () => Stream.fromPubSub(connections),
         }),
         Layer.mock(ThreadManagementService.ThreadManagementService)({
           getShellSnapshot: () =>
@@ -82,6 +92,11 @@ it.effect(
       // Past the idle grace only the running thread is renewed.
       yield* TestClock.adjust("2 hours");
       assert.deepEqual(renewals.at(-1), { environmentId: spoke, threadIds: [running] });
+
+      // A reconnect renews at once instead of waiting out the interval.
+      yield* Queue.clear(renewed);
+      yield* PubSub.publish(connections, undefined);
+      assert.deepEqual(yield* Queue.take(renewed), { environmentId: spoke, threadIds: [running] });
 
       // Unlinked: nothing is sent.
       linked = false;

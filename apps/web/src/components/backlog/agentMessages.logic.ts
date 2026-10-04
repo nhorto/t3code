@@ -21,6 +21,7 @@ export interface AgentMessageFeedView {
 }
 
 export const AGENT_MESSAGE_STATUS_LABELS: Record<AgentMessageStatus, string> = {
+  pending: "Sending",
   delivered: "Delivered",
   held: "Held",
   released: "Released",
@@ -28,17 +29,23 @@ export const AGENT_MESSAGE_STATUS_LABELS: Record<AgentMessageStatus, string> = {
   failed: "Failed",
 };
 
-/** One feed across every connected machine. */
+/**
+ * One feed across every connected machine. A message relayed between machines
+ * keeps its id on both, so it shows once: the receiving machine's copy wins,
+ * since it knows whether the message was delivered or held and is the one that
+ * can release it.
+ */
 export function buildAgentMessageFeed(input: {
   readonly sources: ReadonlyArray<AgentMessageFeedSource>;
   readonly machineLabel: (environmentId: EnvironmentId) => string;
 }): AgentMessageFeedView {
-  const rows: AgentMessageRow[] = [];
+  const byId = new Map<string, AgentMessageRow>();
   for (const source of input.sources) {
     if (source.feed === null) continue;
     const machineLabel = input.machineLabel(source.environmentId);
     for (const message of source.feed.messages) {
-      rows.push({
+      if (byId.has(message.id) && source.environmentId !== message.to.environmentId) continue;
+      byId.set(message.id, {
         key: `${source.environmentId}:${message.id}`,
         environmentId: source.environmentId,
         machineLabel,
@@ -52,6 +59,7 @@ export function buildAgentMessageFeed(input: {
       : left.message.createdAt < right.message.createdAt
         ? -1
         : 1;
+  const rows = [...byId.values()];
   return {
     held: rows.filter((row) => row.message.status === "held").toSorted(byCreated),
     recent: rows
@@ -60,14 +68,28 @@ export function buildAgentMessageFeed(input: {
   };
 }
 
+/** Only the receiving machine's copy of a held message can be released or dismissed. */
+export function canActOnAgentMessage(row: AgentMessageRow): boolean {
+  return row.message.status === "held" && row.environmentId === row.message.to.environmentId;
+}
+
+/** Held messages across machines, counting a relayed message once. */
 export function countHeldAgentMessageRows(sources: ReadonlyArray<AgentMessageFeedSource>): number {
-  let count = 0;
+  const held = new Set<string>();
   for (const source of sources) {
     for (const message of source.feed?.messages ?? []) {
-      if (message.status === "held") count++;
+      if (message.status === "held") held.add(message.id);
     }
   }
-  return count;
+  return held.size;
+}
+
+/** Where the message was logged, and the sender's machine when it came from another one. */
+export function agentMessageMachineLabel(row: AgentMessageRow): string {
+  const sender = row.message.from.machine;
+  return sender && sender !== row.machineLabel
+    ? `${sender} → ${row.machineLabel}`
+    : row.machineLabel;
 }
 
 /** The message on one line, cut at a word near the limit. */

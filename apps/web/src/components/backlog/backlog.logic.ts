@@ -25,7 +25,9 @@ import type { Project } from "../../types";
 
 /**
  * What one environment's board can honestly claim. `stale` keeps the last snapshot on screen,
- * read-only, while its connection is down; `unavailable` has nothing to show at all.
+ * read-only, while its connection is down (from this session, or saved by an earlier one);
+ * `unavailable` has nothing to show at all. A saved copy shown while the connection comes up is
+ * `loading`: visible and read-only, without an offline notice.
  */
 export type BacklogSourceStatus = "loading" | "live" | "stale" | "unavailable" | "error";
 
@@ -33,13 +35,29 @@ export function resolveBacklogSourceStatus(input: {
   readonly connectionPhase: EnvironmentConnectionPhase | null;
   readonly hasBoard: boolean;
   readonly failed: boolean;
+  /** The board is this client's saved copy, not yet confirmed by the environment. */
+  readonly fromCache?: boolean;
 }): BacklogSourceStatus {
   const connected = input.connectionPhase === "connected";
+  const coming = input.connectionPhase === "connecting" || input.connectionPhase === "reconnecting";
+  if (input.hasBoard && input.fromCache) {
+    if (connected && input.failed) return "error";
+    return connected || coming ? "loading" : "stale";
+  }
   if (input.hasBoard) return connected ? "live" : "stale";
   if (connected) return input.failed ? "error" : "loading";
-  return input.connectionPhase === "connecting" || input.connectionPhase === "reconnecting"
-    ? "loading"
-    : "unavailable";
+  return coming ? "loading" : "unavailable";
+}
+
+/** The notice for a board shown from its last known state. */
+export function backlogOfflineNotice(
+  source: Pick<BacklogSource, "label" | "board">,
+  formatTime: (iso: string) => string,
+): string {
+  const asOf = source.board?.asOf;
+  return asOf === undefined
+    ? `Offline — showing ${source.label}'s last known board; changes are disabled.`
+    : `Offline — showing ${source.label}'s board as of ${formatTime(asOf)}; changes are disabled.`;
 }
 
 export interface BacklogSource {
@@ -53,6 +71,64 @@ export interface BacklogSource {
 
 export function isBacklogSourceWritable(source: Pick<BacklogSource, "status">): boolean {
   return source.status === "live";
+}
+
+/** Live, and not a redirect left behind by a move to another machine. */
+export function isBacklogRefWritable(
+  ref: BacklogRef,
+  sourceById: ReadonlyMap<EnvironmentId, Pick<BacklogSource, "status">>,
+): boolean {
+  const source = sourceById.get(ref.environmentId);
+  return (
+    source !== undefined && isBacklogSourceWritable(source) && ref.backlog.movedTo === undefined
+  );
+}
+
+/** Ids of the backlogs on a board that moved away; their issues are read-only here. */
+export function movedBacklogIds(board: BacklogBoardState | null): ReadonlySet<BacklogId> {
+  return new Set(
+    (board?.backlogs ?? [])
+      .filter((backlog) => backlog.movedTo !== undefined)
+      .map((backlog) => backlog.id),
+  );
+}
+
+/**
+ * A move leaves a redirect on the old machine with the same backlog id. Where the client also
+ * sees the board itself, the redirect is left out so issues do not show twice.
+ */
+export function withoutSupersededRedirects(
+  refs: ReadonlyArray<BacklogRef>,
+): ReadonlyArray<BacklogRef> {
+  const live = new Set(
+    refs.filter((ref) => ref.backlog.movedTo === undefined).map((ref) => ref.backlog.id),
+  );
+  return refs.filter((ref) => ref.backlog.movedTo === undefined || !live.has(ref.backlog.id));
+}
+
+/**
+ * Machines a project board can move to: connected ones, other than its home, without a board
+ * of their own for the repository. Only a live project board with a repository moves.
+ */
+export function boardHomeTargets(
+  ref: BacklogRef,
+  sources: ReadonlyArray<BacklogSource>,
+): ReadonlyArray<BacklogSource> {
+  const { backlog } = ref;
+  if (backlog.kind !== "project" || backlog.repositoryKey === null) return [];
+  if (backlog.movedTo !== undefined) return [];
+  const home = sources.find((source) => source.environmentId === ref.environmentId);
+  if (home === undefined || !isBacklogSourceWritable(home)) return [];
+  return sources.filter(
+    (source) =>
+      source.environmentId !== ref.environmentId &&
+      isBacklogSourceWritable(source) &&
+      !(source.board?.backlogs ?? []).some(
+        (other) =>
+          other.movedTo === undefined &&
+          (other.id === backlog.id || other.repositoryKey === backlog.repositoryKey),
+      ),
+  );
 }
 
 // Scope (the switcher)
@@ -169,11 +245,22 @@ function resolveProjectCreate(input: {
   };
   const label = (environmentId: EnvironmentId) =>
     sourceById.get(environmentId)?.label ?? "Unknown machine";
-  const existing = preferPrimary(input.backlogs, writable, primaryEnvironmentId);
+  const existing = preferPrimary(
+    input.backlogs.filter((ref) => ref.backlog.movedTo === undefined),
+    writable,
+    primaryEnvironmentId,
+  );
   if (existing) {
     return {
       createTarget: { environmentId: existing.environmentId, backlogId: existing.backlog.id },
       createBlockedReason: null,
+    };
+  }
+  const moved = input.backlogs.find((ref) => ref.backlog.movedTo !== undefined);
+  if (moved !== undefined && moved.backlog.movedTo !== undefined) {
+    return {
+      createTarget: null,
+      createBlockedReason: `This board moved to ${moved.backlog.movedTo.label}, which is not connected.`,
     };
   }
   if (input.backlogs.length > 0) {
@@ -295,11 +382,13 @@ export function buildBacklogSwitcherEntries(
     return source !== undefined && isBacklogSourceWritable(source);
   };
 
-  const allBacklogs: BacklogRef[] = sources.flatMap((source) =>
-    (source.board?.backlogs ?? []).map((backlog) => ({
-      environmentId: source.environmentId,
-      backlog,
-    })),
+  const allBacklogs = withoutSupersededRedirects(
+    sources.flatMap((source) =>
+      (source.board?.backlogs ?? []).map((backlog) => ({
+        environmentId: source.environmentId,
+        backlog,
+      })),
+    ),
   );
   const inboxes = allBacklogs.filter((ref) => ref.backlog.kind === "inbox");
 
@@ -818,7 +907,7 @@ export function backlogMoveTargets(input: {
 }): ReadonlyArray<BacklogMoveTarget> {
   const projectsWithBacklog = new Set(input.backlogs.map((backlog) => backlog.projectId));
   const existing = input.backlogs
-    .filter((backlog) => backlog.id !== input.currentBacklogId)
+    .filter((backlog) => backlog.id !== input.currentBacklogId && backlog.movedTo === undefined)
     .map((backlog): BacklogMoveTarget => ({
       value: `backlog:${backlog.id}`,
       label: backlog.kind === "inbox" ? "Inbox" : `${backlog.title} (${backlog.key})`,

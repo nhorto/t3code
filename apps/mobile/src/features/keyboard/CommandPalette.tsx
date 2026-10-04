@@ -208,6 +208,13 @@ export function CommandPalette(props: {
         run: () => navigation.navigate("Backlog"),
       },
       {
+        key: "agentMessages",
+        kind: "action",
+        title: "Open agent messages",
+        searchTerms: ["held", "release", "agents", "inbox"],
+        run: () => navigation.navigate("BacklogMessages"),
+      },
+      {
         key: "settings",
         kind: "action",
         title: "Open settings",

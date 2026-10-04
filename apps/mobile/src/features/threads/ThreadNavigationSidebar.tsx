@@ -54,6 +54,7 @@ import { useMaterialToolbarLayout } from "../../components/useMaterialToolbarLay
 import { useMaterialFabScroll } from "../home/MaterialFabScrollContext";
 import { SidebarFilterButton } from "./sidebar-filter-button";
 import { createSidebarHeaderItems } from "./sidebar-native-header-items";
+import { useHeldAgentMessageCount } from "../backlog/useAgentMessages";
 import { SidebarNavigationShell } from "./sidebar-navigation-shell";
 import {
   ThreadListV2PendingRow,
@@ -856,6 +857,7 @@ function ThreadNavigationSidebarPane(
       }),
     [environments, options, projectFilterOptions, selectedProjectKey, setSelectedEnvironmentId],
   );
+  const heldMessageCount = useHeldAgentMessageCount();
   const nativeHeaderItems = useMemo(
     () =>
       createSidebarHeaderItems({
@@ -863,8 +865,9 @@ function ThreadNavigationSidebarPane(
         filterMenu,
         onOpenSettings: props.onOpenSettings,
         onOpenBacklog: props.onOpenBacklog,
+        heldMessageCount,
       }),
-    [filterIcon, filterMenu, props.onOpenBacklog, props.onOpenSettings],
+    [filterIcon, filterMenu, heldMessageCount, props.onOpenBacklog, props.onOpenSettings],
   );
   // Snoozed threads need no special case: the shelf header is a list row
   // even while collapsed.
@@ -1071,6 +1074,7 @@ function ThreadNavigationSidebarPane(
               <SidebarHeaderActions
                 onOpenSettings={props.onOpenSettings}
                 onOpenBacklog={props.onOpenBacklog}
+                heldMessageCount={heldMessageCount}
               />
             </View>
           </View>
