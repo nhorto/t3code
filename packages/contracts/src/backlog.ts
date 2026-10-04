@@ -1,0 +1,321 @@
+import * as Schema from "effect/Schema";
+
+import {
+  BacklogId,
+  BacklogIssueId,
+  EnvironmentId,
+  IsoDateTime,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
+
+/** Lease length for an agent's claim; renewed while the claiming thread is alive. */
+export const BACKLOG_CLAIM_LEASE_MS = 15 * 60_000;
+
+export const BacklogIssueStatus = Schema.Literals([
+  "inbox",
+  "backlog",
+  "ready",
+  "in_progress",
+  "review",
+  "done",
+  "wontfix",
+]).annotate({
+  description:
+    "Board column. inbox: untriaged; backlog: accepted, not ready; ready: may be claimed; in_progress: claimed or being worked; review: work done, awaiting a human; done and wontfix: closed.",
+});
+export type BacklogIssueStatus = typeof BacklogIssueStatus.Type;
+
+export const BACKLOG_ISSUE_STATUSES = BacklogIssueStatus.literals;
+export const BACKLOG_CLOSED_STATUSES: ReadonlyArray<BacklogIssueStatus> = ["done", "wontfix"];
+
+export const BacklogIssueType = Schema.Literals(["idea", "bug", "feature"]).annotate({
+  description: "Issue type. Defaults to idea.",
+});
+export type BacklogIssueType = typeof BacklogIssueType.Type;
+
+export const BacklogIssuePriority = Schema.Literals(["p0", "p1", "p2", "p3"]).annotate({
+  description: "Priority, p0 most urgent. Null means unprioritized.",
+});
+export type BacklogIssuePriority = typeof BacklogIssuePriority.Type;
+
+/** Short human key for a backlog, such as WINE. Issue keys append the number: WINE-12. */
+export const BacklogKey = TrimmedNonEmptyString.check(
+  Schema.isPattern(/^[A-Z][A-Z0-9]{0,9}$/),
+).annotate({
+  description: "Uppercase short key, 1-10 characters, starting with a letter. Example: WINE.",
+});
+export type BacklogKey = typeof BacklogKey.Type;
+
+/** Who did something on a backlog. Agents carry their thread; users do not. */
+export const BacklogActor = Schema.Struct({
+  kind: Schema.Literals(["user", "agent", "system"]),
+  environmentId: Schema.NullOr(EnvironmentId),
+  threadId: Schema.NullOr(ThreadId),
+  label: Schema.String,
+});
+export type BacklogActor = typeof BacklogActor.Type;
+
+export const Backlog = Schema.Struct({
+  id: BacklogId,
+  kind: Schema.Literals(["inbox", "project"]),
+  key: BacklogKey,
+  title: TrimmedNonEmptyString,
+  /** Null for the Inbox. */
+  projectId: Schema.NullOr(ProjectId),
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+});
+export type Backlog = typeof Backlog.Type;
+
+export const BacklogIssueClaim = Schema.Struct({
+  actor: BacklogActor,
+  claimedAt: IsoDateTime,
+  leaseExpiresAt: IsoDateTime,
+});
+export type BacklogIssueClaim = typeof BacklogIssueClaim.Type;
+
+export const BacklogIssueLink = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("thread"),
+    environmentId: Schema.NullOr(EnvironmentId),
+    threadId: ThreadId,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("pull_request"),
+    url: TrimmedNonEmptyString,
+  }),
+]);
+export type BacklogIssueLink = typeof BacklogIssueLink.Type;
+
+/**
+ * Board row. Carries everything a board, list or graph needs, but not the
+ * body, which can be a long spec; fetch it with `backlog.getIssue`.
+ */
+export const BacklogIssue = Schema.Struct({
+  id: BacklogIssueId,
+  backlogId: BacklogId,
+  number: Schema.Int.check(Schema.isGreaterThan(0)),
+  /** Display key such as WINE-12. Follows the backlog key when it is edited. */
+  key: TrimmedNonEmptyString,
+  title: TrimmedNonEmptyString,
+  type: BacklogIssueType,
+  status: BacklogIssueStatus,
+  priority: Schema.NullOr(BacklogIssuePriority),
+  parentId: Schema.NullOr(BacklogIssueId),
+  blockedBy: Schema.Array(BacklogIssueId),
+  claim: Schema.NullOr(BacklogIssueClaim),
+  links: Schema.Array(BacklogIssueLink),
+  hasBody: Schema.Boolean,
+  createdBy: BacklogActor,
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+  closedAt: Schema.NullOr(IsoDateTime),
+});
+export type BacklogIssue = typeof BacklogIssue.Type;
+
+export const BacklogActivityKind = Schema.Literals([
+  "created",
+  "edited",
+  "status_changed",
+  "moved",
+  "claimed",
+  "released",
+  "lease_expired",
+  "commented",
+  "linked",
+]);
+export type BacklogActivityKind = typeof BacklogActivityKind.Type;
+
+export const BacklogActivity = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  issueId: BacklogIssueId,
+  kind: BacklogActivityKind,
+  actor: BacklogActor,
+  at: IsoDateTime,
+  /** Comment text, or a short human summary for non-comment entries. */
+  text: Schema.NullOr(Schema.String),
+  fromStatus: Schema.NullOr(BacklogIssueStatus),
+  toStatus: Schema.NullOr(BacklogIssueStatus),
+});
+export type BacklogActivity = typeof BacklogActivity.Type;
+
+export const BacklogIssueDetail = Schema.Struct({
+  issue: BacklogIssue,
+  body: Schema.String,
+  /** The parent spec, so an agent claiming a child has the context. */
+  parent: Schema.NullOr(
+    Schema.Struct({
+      issue: BacklogIssue,
+      body: Schema.String,
+    }),
+  ),
+  children: Schema.Array(BacklogIssue),
+  blockers: Schema.Array(BacklogIssue),
+  activity: Schema.Array(BacklogActivity),
+});
+export type BacklogIssueDetail = typeof BacklogIssueDetail.Type;
+
+export class BacklogError extends Schema.TaggedError<BacklogError>()("BacklogError", {
+  code: Schema.Literals(["not_found", "conflict", "invalid"]),
+  message: Schema.String,
+  issueId: Schema.optional(BacklogIssueId),
+  cause: Schema.optional(Schema.Defect()),
+}) {}
+
+// Stream
+
+export const BacklogStreamEvent = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("snapshot"),
+    backlogs: Schema.Array(Backlog),
+    issues: Schema.Array(BacklogIssue),
+  }),
+  Schema.Struct({ type: Schema.Literal("backlogUpserted"), backlog: Backlog }),
+  Schema.Struct({ type: Schema.Literal("issueUpserted"), issue: BacklogIssue }),
+]);
+export type BacklogStreamEvent = typeof BacklogStreamEvent.Type;
+
+// Inputs
+
+export const BacklogSubscribeInput = Schema.Struct({});
+export type BacklogSubscribeInput = typeof BacklogSubscribeInput.Type;
+
+export const BacklogGetIssueInput = Schema.Struct({ issueId: BacklogIssueId });
+export type BacklogGetIssueInput = typeof BacklogGetIssueInput.Type;
+
+export const BacklogCreateIssueInput = Schema.Struct({
+  backlogId: Schema.optional(BacklogId).annotate({
+    description: "Target backlog. Takes precedence over projectId.",
+  }),
+  projectId: Schema.optional(ProjectId).annotate({
+    description:
+      "Target the project's backlog, creating it on first use. Omit both backlogId and projectId for the Inbox.",
+  }),
+  title: TrimmedNonEmptyString,
+  body: Schema.optional(Schema.String).annotate({ description: "Markdown body." }),
+  type: Schema.optional(BacklogIssueType),
+  status: Schema.optional(BacklogIssueStatus).annotate({
+    description: "Defaults to inbox in the Inbox and backlog in a project backlog.",
+  }),
+  priority: Schema.optional(Schema.NullOr(BacklogIssuePriority)),
+  parentId: Schema.optional(Schema.NullOr(BacklogIssueId)),
+  blockedBy: Schema.optional(Schema.Array(BacklogIssueId)),
+});
+export type BacklogCreateIssueInput = typeof BacklogCreateIssueInput.Type;
+
+/** Omitted fields are preserved. */
+export const BacklogUpdateIssueInput = Schema.Struct({
+  issueId: BacklogIssueId,
+  title: Schema.optional(TrimmedNonEmptyString),
+  body: Schema.optional(Schema.String),
+  type: Schema.optional(BacklogIssueType),
+  status: Schema.optional(BacklogIssueStatus),
+  priority: Schema.optional(Schema.NullOr(BacklogIssuePriority)),
+  parentId: Schema.optional(Schema.NullOr(BacklogIssueId)),
+  blockedBy: Schema.optional(Schema.Array(BacklogIssueId)).annotate({
+    description: "Replaces the full blocker list.",
+  }),
+  backlogId: Schema.optional(BacklogId).annotate({
+    description: "Move the issue to another backlog, e.g. triaging from the Inbox to a project.",
+  }),
+});
+export type BacklogUpdateIssueInput = typeof BacklogUpdateIssueInput.Type;
+
+export const BacklogCommentInput = Schema.Struct({
+  issueId: BacklogIssueId,
+  text: TrimmedNonEmptyString,
+});
+export type BacklogCommentInput = typeof BacklogCommentInput.Type;
+
+export const BacklogReleaseStatus = Schema.Literals(["ready", "review", "done", "backlog"]);
+export type BacklogReleaseStatus = typeof BacklogReleaseStatus.Type;
+
+/** From a client this is a force-release: it clears any holder's claim. */
+export const BacklogReleaseInput = Schema.Struct({
+  issueId: BacklogIssueId,
+  status: BacklogReleaseStatus,
+  note: Schema.optional(Schema.String),
+});
+export type BacklogReleaseInput = typeof BacklogReleaseInput.Type;
+
+export const BacklogUpdateBacklogInput = Schema.Struct({
+  backlogId: BacklogId,
+  key: Schema.optional(BacklogKey),
+  title: Schema.optional(TrimmedNonEmptyString),
+});
+export type BacklogUpdateBacklogInput = typeof BacklogUpdateBacklogInput.Type;
+
+// Derived helpers shared by server and clients.
+
+export function isBacklogStatusClosed(status: BacklogIssueStatus): boolean {
+  return status === "done" || status === "wontfix";
+}
+
+/** Blocked while any blocker is still open. Unknown blockers count as open. */
+export function isBacklogIssueBlocked(
+  issue: Pick<BacklogIssue, "blockedBy">,
+  issuesById: ReadonlyMap<BacklogIssueId, Pick<BacklogIssue, "status">>,
+): boolean {
+  return issue.blockedBy.some((blockerId) => {
+    const blocker = issuesById.get(blockerId);
+    return blocker === undefined || !isBacklogStatusClosed(blocker.status);
+  });
+}
+
+/** The frontier: ready, unblocked and unclaimed. The only issues an agent may claim. */
+export function isBacklogIssueOnFrontier(
+  issue: Pick<BacklogIssue, "status" | "blockedBy" | "claim">,
+  issuesById: ReadonlyMap<BacklogIssueId, Pick<BacklogIssue, "status">>,
+): boolean {
+  return (
+    issue.status === "ready" && issue.claim === null && !isBacklogIssueBlocked(issue, issuesById)
+  );
+}
+
+const PRIORITY_RANK: Record<BacklogIssuePriority, number> = { p0: 0, p1: 1, p2: 2, p3: 3 };
+
+/** Claim-next order: priority first (unprioritized last), then oldest first, then number. */
+export function compareBacklogIssuesForClaim(
+  left: Pick<BacklogIssue, "priority" | "createdAt" | "number">,
+  right: Pick<BacklogIssue, "priority" | "createdAt" | "number">,
+): number {
+  const leftRank = left.priority === null ? 4 : PRIORITY_RANK[left.priority];
+  const rightRank = right.priority === null ? 4 : PRIORITY_RANK[right.priority];
+  if (leftRank !== rightRank) return leftRank - rightRank;
+  if (left.createdAt !== right.createdAt) return left.createdAt < right.createdAt ? -1 : 1;
+  return left.number - right.number;
+}
+
+/** Derive a short key from a project title: "Cork & Note" -> "CN", "wine" -> "WINE". */
+export function deriveBacklogKey(title: string): string {
+  const words = title
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, " ")
+    .trim()
+    .split(" ")
+    .filter((word) => word.length > 0);
+  const lettersOnly = words.filter((word) => /^[A-Z]/.test(word));
+  if (lettersOnly.length === 0) return "PROJ";
+  const key =
+    lettersOnly.length === 1
+      ? lettersOnly[0]!.slice(0, 6)
+      : lettersOnly
+          .map((word) => word[0])
+          .join("")
+          .slice(0, 6);
+  return key.length >= 2 ? key : lettersOnly[0]!.slice(0, 4);
+}
+
+/** Parse "wine-12" or "WINE-12" into its parts. */
+export function parseBacklogIssueKey(
+  value: string,
+): { readonly backlogKey: string; readonly number: number } | null {
+  const match = /^\s*([A-Za-z][A-Za-z0-9]{0,9})-(\d+)\s*$/.exec(value);
+  if (match === null) return null;
+  const number = Number(match[2]);
+  return Number.isSafeInteger(number) && number > 0
+    ? { backlogKey: match[1]!.toUpperCase(), number }
+    : null;
+}

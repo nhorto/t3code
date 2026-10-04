@@ -316,6 +316,21 @@ import {
   ScheduledTaskMutationResult,
 } from "./scheduledTask.ts";
 import {
+  Backlog,
+  BacklogActivity,
+  BacklogCommentInput,
+  BacklogCreateIssueInput,
+  BacklogError,
+  BacklogGetIssueInput,
+  BacklogIssue,
+  BacklogIssueDetail,
+  BacklogReleaseInput,
+  BacklogStreamEvent,
+  BacklogSubscribeInput,
+  BacklogUpdateBacklogInput,
+  BacklogUpdateIssueInput,
+} from "./backlog.ts";
+import {
   ProjectCloneActionInput,
   ProjectCloneActionResult,
   ProjectCloneListEvent,
@@ -474,6 +489,15 @@ export const WS_METHODS = {
   scheduledTasksSetEnabled: "scheduledTasks.setEnabled",
   scheduledTasksDelete: "scheduledTasks.delete",
   scheduledTasksRunNow: "scheduledTasks.runNow",
+
+  // Backlog
+  backlogSubscribe: "backlog.subscribe",
+  backlogGetIssue: "backlog.getIssue",
+  backlogCreateIssue: "backlog.createIssue",
+  backlogUpdateIssue: "backlog.updateIssue",
+  backlogComment: "backlog.comment",
+  backlogRelease: "backlog.release",
+  backlogUpdateBacklog: "backlog.updateBacklog",
 
   // Cloud environment methods
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
@@ -1662,6 +1686,52 @@ const WsScheduledTasksRunNowRpc = Rpc.make(WS_METHODS.scheduledTasksRunNow, {
   error: Schema.Union([ScheduledTaskError, EnvironmentAuthorizationError]),
 });
 
+const BacklogRpcError = Schema.Union([BacklogError, EnvironmentAuthorizationError]);
+
+/** Streams every backlog on this environment: one snapshot, then row deltas. */
+const WsBacklogSubscribeRpc = Rpc.make(WS_METHODS.backlogSubscribe, {
+  payload: BacklogSubscribeInput,
+  success: BacklogStreamEvent,
+  error: BacklogRpcError,
+  stream: true,
+});
+
+const WsBacklogGetIssueRpc = Rpc.make(WS_METHODS.backlogGetIssue, {
+  payload: BacklogGetIssueInput,
+  success: BacklogIssueDetail,
+  error: BacklogRpcError,
+});
+
+const WsBacklogCreateIssueRpc = Rpc.make(WS_METHODS.backlogCreateIssue, {
+  payload: BacklogCreateIssueInput,
+  success: BacklogIssue,
+  error: BacklogRpcError,
+});
+
+const WsBacklogUpdateIssueRpc = Rpc.make(WS_METHODS.backlogUpdateIssue, {
+  payload: BacklogUpdateIssueInput,
+  success: BacklogIssue,
+  error: BacklogRpcError,
+});
+
+const WsBacklogCommentRpc = Rpc.make(WS_METHODS.backlogComment, {
+  payload: BacklogCommentInput,
+  success: BacklogActivity,
+  error: BacklogRpcError,
+});
+
+const WsBacklogReleaseRpc = Rpc.make(WS_METHODS.backlogRelease, {
+  payload: BacklogReleaseInput,
+  success: BacklogIssue,
+  error: BacklogRpcError,
+});
+
+const WsBacklogUpdateBacklogRpc = Rpc.make(WS_METHODS.backlogUpdateBacklog, {
+  payload: BacklogUpdateBacklogInput,
+  success: Backlog,
+  error: BacklogRpcError,
+});
+
 const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess, {
   payload: Schema.Struct({}),
   success: AuthAccessStreamEvent,
@@ -1747,6 +1817,13 @@ export const WsRpcGroup = RpcGroup.make(
   WsScheduledTasksSetEnabledRpc,
   WsScheduledTasksDeleteRpc,
   WsScheduledTasksRunNowRpc,
+  WsBacklogSubscribeRpc,
+  WsBacklogGetIssueRpc,
+  WsBacklogCreateIssueRpc,
+  WsBacklogUpdateIssueRpc,
+  WsBacklogCommentRpc,
+  WsBacklogReleaseRpc,
+  WsBacklogUpdateBacklogRpc,
   WsServerReportClientActivityRpc,
   WsServerReportHostPowerStateRpc,
   WsServerGetBackgroundPolicyRpc,
