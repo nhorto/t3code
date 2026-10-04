@@ -82,6 +82,7 @@ import {
   WORKTREE_SETUP_ACTIVITY_KIND,
   worktreeSetupActivityId,
   type WorktreeSetupSnapshot,
+  hasAuthScope,
 } from "@t3tools/contracts";
 import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
@@ -154,6 +155,12 @@ import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import { requiredScopeForRpcMethod, requiredScopeForDeviceList } from "./auth/RpcAuthorization.ts";
+import * as BacklogService from "./backlog/BacklogService.ts";
+import * as BacklogHubClient from "./backlog/BacklogHubClient.ts";
+import * as BacklogRouter from "./backlog/BacklogRouter.ts";
+import { localBacklogHome } from "./backlog/BacklogHome.ts";
+import * as AgentMessageService from "./agentMessages/AgentMessageService.ts";
+import * as AgentMessageRelay from "./agentMessages/AgentMessageRelay.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as ResourceTelemetry from "./resourceTelemetry/ResourceTelemetry.ts";
@@ -675,6 +682,19 @@ const makeWsRpcLayer = (
       const resourceTelemetry = yield* ResourceTelemetry.ResourceTelemetry;
       const usage = yield* UsageService.UsageService;
       const relayClient = yield* RelayClient.RelayClient;
+      const backlog = yield* BacklogService.BacklogService;
+      const backlogHome = localBacklogHome(backlog);
+      const backlogHub = yield* BacklogHubClient.BacklogHubClient;
+      const backlogRouter = yield* BacklogRouter.BacklogRouter;
+      const agentMessages = yield* AgentMessageService.AgentMessageService;
+      const agentMessageRelay = yield* AgentMessageRelay.AgentMessageRelay;
+      // Clients act as the user of this environment; agents reach the backlog through MCP.
+      const backlogUser = {
+        kind: "user" as const,
+        environmentId: yield* serverEnvironment.getEnvironmentId,
+        threadId: null,
+        label: "You",
+      };
       const authorizationError = (requiredScope: AuthEnvironmentScope) =>
         new EnvironmentAuthorizationError({
           message: `The authenticated token is missing required scope: ${requiredScope}.`,
@@ -684,14 +704,14 @@ const makeWsRpcLayer = (
         requiredScope: AuthEnvironmentScope,
         effect: Effect.Effect<A, E, R>,
       ): Effect.Effect<A, E | EnvironmentAuthorizationError, R> =>
-        currentSession.scopes.includes(requiredScope)
+        hasAuthScope(currentSession.scopes, requiredScope)
           ? effect
           : Effect.fail(authorizationError(requiredScope));
       const authorizeStream = <A, E, R>(
         requiredScope: AuthEnvironmentScope,
         stream: Stream.Stream<A, E, R>,
       ): Stream.Stream<A, E | EnvironmentAuthorizationError, R> =>
-        currentSession.scopes.includes(requiredScope)
+        hasAuthScope(currentSession.scopes, requiredScope)
           ? stream
           : Stream.fail(authorizationError(requiredScope));
       const observeRpcEffect = <A, E, R>(
@@ -2609,6 +2629,180 @@ const makeWsRpcLayer = (
             }),
             { "rpc.aggregate": "orchestration" },
           ),
+        [WS_METHODS.backlogSubscribe]: (_input) =>
+          observeRpcStream(WS_METHODS.backlogSubscribe, backlogRouter.subscribe(), {
+            "rpc.aggregate": "backlog",
+          }),
+        [WS_METHODS.backlogGetIssue]: (input) =>
+          observeRpcEffect(WS_METHODS.backlogGetIssue, backlog.getIssue(input), {
+            "rpc.aggregate": "backlog",
+            "backlog.issue_id": input.issueId,
+          }),
+        [WS_METHODS.backlogCreateIssue]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.backlogCreateIssue,
+            // A client naming only a project, or nothing (the Inbox), lets the router place
+            // the issue, so a linked spoke files it on the hub's board or the hub's Inbox.
+            input.backlogId === undefined &&
+              input.repository === undefined &&
+              input.actor === undefined
+              ? backlogRouter.createIssue(
+                  {
+                    projectId: input.projectId,
+                    title: input.title,
+                    body: input.body,
+                    type: input.type,
+                    status: input.status,
+                    priority: input.priority,
+                    parent: input.parentId ?? undefined,
+                    blockedBy: input.blockedBy,
+                  },
+                  backlogUser,
+                )
+              : backlog.createIssue(input, input.actor ?? backlogUser),
+            {
+              "rpc.aggregate": "backlog",
+            },
+          ),
+        [WS_METHODS.backlogUpdateIssue]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.backlogUpdateIssue,
+            backlog.updateIssue(input, input.actor ?? backlogUser),
+            {
+              "rpc.aggregate": "backlog",
+              "backlog.issue_id": input.issueId,
+            },
+          ),
+        [WS_METHODS.backlogComment]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.backlogComment,
+            backlog.comment(input, input.actor ?? backlogUser),
+            {
+              "rpc.aggregate": "backlog",
+              "backlog.issue_id": input.issueId,
+            },
+          ),
+        [WS_METHODS.backlogRelease]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.backlogRelease,
+            backlog.release(input, input.actor ?? backlogUser),
+            {
+              "rpc.aggregate": "backlog",
+              "backlog.issue_id": input.issueId,
+            },
+          ),
+        [WS_METHODS.backlogUpdateBacklog]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.backlogUpdateBacklog,
+            backlog.updateBacklog(input, backlogUser),
+            { "rpc.aggregate": "backlog" },
+          ),
+        // Called by a linked server for its agents, who arrive as input.actor.
+        [WS_METHODS.backlogListBacklogs]: (_input) =>
+          observeRpcEffect(WS_METHODS.backlogListBacklogs, backlog.listBacklogs(), {
+            "rpc.aggregate": "backlog",
+          }),
+        [WS_METHODS.backlogListIssues]: (input) =>
+          observeRpcEffect(WS_METHODS.backlogListIssues, backlog.listIssues(input), {
+            "rpc.aggregate": "backlog",
+          }),
+        [WS_METHODS.backlogResolveIssue]: (input) =>
+          observeRpcEffect(WS_METHODS.backlogResolveIssue, backlog.resolveIssueRef(input.ref), {
+            "rpc.aggregate": "backlog",
+          }),
+        [WS_METHODS.backlogCreateChildren]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.backlogCreateChildren,
+            backlog.createChildren(input, input.actor ?? backlogUser),
+            { "rpc.aggregate": "backlog", "backlog.issue_id": input.parentId },
+          ),
+        [WS_METHODS.backlogClaim]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.backlogClaim,
+            backlog.claim(input, input.actor ?? backlogUser),
+            {
+              "rpc.aggregate": "backlog",
+              "backlog.issue_id": input.issueId,
+            },
+          ),
+        [WS_METHODS.backlogClaimNext]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.backlogClaimNext,
+            backlog.claimNext(input, input.actor ?? backlogUser),
+            { "rpc.aggregate": "backlog" },
+          ),
+        [WS_METHODS.backlogRenewClaims]: (input) =>
+          observeRpcEffect(WS_METHODS.backlogRenewClaims, backlog.renewClaims(input), {
+            "rpc.aggregate": "backlog",
+          }),
+        [WS_METHODS.backlogLinkPullRequest]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.backlogLinkPullRequest,
+            backlogHome.linkPullRequest(input, input.actor ?? backlogUser),
+            { "rpc.aggregate": "backlog" },
+          ),
+        [WS_METHODS.backlogGetHubLink]: (_input) =>
+          observeRpcEffect(WS_METHODS.backlogGetHubLink, backlogHub.status(), {
+            "rpc.aggregate": "backlog",
+          }),
+        [WS_METHODS.backlogLinkHub]: (input) =>
+          observeRpcEffect(WS_METHODS.backlogLinkHub, backlogHub.link(input), {
+            "rpc.aggregate": "backlog",
+          }),
+        [WS_METHODS.backlogUnlinkHub]: (_input) =>
+          observeRpcEffect(WS_METHODS.backlogUnlinkHub, backlogHub.unlink(), {
+            "rpc.aggregate": "backlog",
+          }),
+        [WS_METHODS.backlogExportBacklog]: (input) =>
+          observeRpcEffect(WS_METHODS.backlogExportBacklog, backlog.exportBacklog(input), {
+            "rpc.aggregate": "backlog",
+          }),
+        [WS_METHODS.backlogImportBacklog]: (input) =>
+          observeRpcEffect(WS_METHODS.backlogImportBacklog, backlog.importBacklog(input.export), {
+            "rpc.aggregate": "backlog",
+          }),
+        [WS_METHODS.backlogRestoreBacklog]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.backlogRestoreBacklog,
+            backlog.restoreBacklog(input.backlogId),
+            { "rpc.aggregate": "backlog" },
+          ),
+        [WS_METHODS.backlogMoveInboxToHub]: (_input) =>
+          observeRpcEffect(
+            WS_METHODS.backlogMoveInboxToHub,
+            backlogRouter.moveInboxToHub(backlogUser),
+            { "rpc.aggregate": "backlog" },
+          ),
+        [WS_METHODS.agentMessagesSubscribe]: (_input) =>
+          observeRpcStream(WS_METHODS.agentMessagesSubscribe, agentMessages.subscribe(), {
+            "rpc.aggregate": "agentMessages",
+          }),
+        [WS_METHODS.agentMessagesRelease]: (input) =>
+          observeRpcEffect(WS_METHODS.agentMessagesRelease, agentMessages.release(input), {
+            "rpc.aggregate": "agentMessages",
+          }),
+        [WS_METHODS.agentMessagesDismiss]: (input) =>
+          observeRpcEffect(WS_METHODS.agentMessagesDismiss, agentMessages.dismiss(input), {
+            "rpc.aggregate": "agentMessages",
+          }),
+        [WS_METHODS.agentMessagesSubscribeHeldCount]: (_input) =>
+          observeRpcStream(
+            WS_METHODS.agentMessagesSubscribeHeldCount,
+            agentMessages.subscribeHeldCount(),
+            { "rpc.aggregate": "agentMessages" },
+          ),
+        [WS_METHODS.agentMessagesRelay]: (input) =>
+          observeRpcEffect(WS_METHODS.agentMessagesRelay, agentMessageRelay.relay(input), {
+            "rpc.aggregate": "agentMessages",
+          }),
+        [WS_METHODS.agentMessagesSubscribeInbox]: (input) =>
+          observeRpcStream(WS_METHODS.agentMessagesSubscribeInbox, agentMessageRelay.inbox(input), {
+            "rpc.aggregate": "agentMessages",
+          }),
+        [WS_METHODS.agentMessagesAck]: (input) =>
+          observeRpcEffect(WS_METHODS.agentMessagesAck, agentMessageRelay.ack(input), {
+            "rpc.aggregate": "agentMessages",
+          }),
         [WS_METHODS.serverProbe]: (_input) =>
           observeRpcEffect(WS_METHODS.serverProbe, Effect.succeed({}), {
             "rpc.aggregate": "server",

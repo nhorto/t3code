@@ -10,6 +10,12 @@ describe("buildRuntimeInstructions", () => {
     expect(instructions).toContain("call list_thread_pull_requests and link any PR");
   });
 
+  it("points agents at the backlog and agent messages", () => {
+    const instructions = buildRuntimeInstructions({ harness: "Claude" });
+    expect(instructions).toContain("call `backlog_create_issue` with the project's id");
+    expect(instructions).toContain("answer it with `agent_message`");
+  });
+
   it("keeps known model and effort metadata on one line", () => {
     expect(
       buildRuntimeInstructions({

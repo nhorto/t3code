@@ -110,6 +110,12 @@ import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as ServerConfig from "./config.ts";
 import * as DeviceService from "./device/DeviceService.ts";
 import { HTTP_ROUTER_CONFIG, makeRoutesLayer } from "./server.ts";
+import * as AgentMessageRelay from "./agentMessages/AgentMessageRelay.ts";
+import * as AgentMessageService from "./agentMessages/AgentMessageService.ts";
+import type { BacklogHome } from "./backlog/BacklogHome.ts";
+import * as BacklogHubClient from "./backlog/BacklogHubClient.ts";
+import * as BacklogRouter from "./backlog/BacklogRouter.ts";
+import * as BacklogService from "./backlog/BacklogService.ts";
 import {
   isThreadDetailEvent,
   resolveAvailableEditorsForConfig,
@@ -898,6 +904,12 @@ const buildAppUnderTest = (options?: {
         }),
       ),
       Layer.provide([
+        // The backlog's RPCs are covered by its own tests; these routes never reach it.
+        Layer.mock(BacklogService.BacklogService)({}),
+        Layer.mock(BacklogRouter.BacklogRouter)({}),
+        Layer.mock(BacklogHubClient.BacklogHubClient)({ home: {} as BacklogHome }),
+        Layer.mock(AgentMessageService.AgentMessageService)({}),
+        Layer.mock(AgentMessageRelay.AgentMessageRelay)({}),
         HostResources.layer,
         Layer.mock(ProcessResourceMonitor.ProcessResourceMonitor)({
           readHistory: (input) =>

@@ -73,6 +73,9 @@ import * as TextGeneration from "./textGeneration/TextGeneration.ts";
 import { ProviderInstanceRegistryHydrationLive } from "./provider/Layers/ProviderInstanceRegistryHydration.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as McpHttpServer from "./mcp/McpHttpServer.ts";
+import * as AgentMessageService from "./agentMessages/AgentMessageService.ts";
+import * as BacklogOrchestration from "./backlog/BacklogOrchestration.ts";
+import * as BacklogService from "./backlog/BacklogService.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as DeviceService from "./device/DeviceService.ts";
@@ -508,7 +511,15 @@ const ProviderInstallationRefreshLive = Layer.effectDiscard(
   }),
 );
 
+// The backlog and its fleet link: agents here reach a linked hub's backlogs,
+// and message agents on other linked machines through it.
+const BacklogLayerLive = AgentMessageService.fleetLayer.pipe(
+  Layer.provideMerge(BacklogService.layer),
+  Layer.provideMerge(BacklogOrchestration.layer),
+);
+
 const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
+  Layer.provideMerge(BacklogLayerLive),
   Layer.provideMerge(ProviderInstallationRefreshLive),
   Layer.provideMerge(ReplayMarkers.layer),
   Layer.provideMerge(ProviderAuthServiceLive),

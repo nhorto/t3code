@@ -19,6 +19,7 @@ import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
+import * as BacklogRouter from "../../../backlog/BacklogRouter.ts";
 import * as OrchestrationEngine from "../../../orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -147,6 +148,38 @@ const make = Effect.gen(function* () {
   const engine = yield* OrchestrationEngine.OrchestrationEngineService;
   const snapshots = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
   const crypto = yield* Crypto.Crypto;
+  // Optional so hosts without a backlog (and tests) keep linking pull requests.
+  const backlog = yield* Effect.serviceOption(BacklogRouter.BacklogRouter);
+
+  /**
+   * A linked pull request also lands on every backlog issue the thread holds,
+   * here and on a linked hub. Best-effort: it must never fail the link itself,
+   * and storage failures are defects, so the whole cause is caught.
+   */
+  const linkToClaimedIssues = (thread: OrchestrationThreadShell, url: string) =>
+    Option.match(backlog, {
+      onNone: () => Effect.void,
+      onSome: (router) =>
+        McpInvocationContext.McpInvocationContext.pipe(
+          Effect.flatMap((scope) =>
+            router.linkPullRequest(
+              { url },
+              {
+                kind: "agent",
+                environmentId: scope.environmentId,
+                threadId: thread.id,
+                label: `${thread.title} · ${thread.modelSelection.model}`,
+              },
+            ),
+          ),
+          Effect.asVoid,
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Could not link the pull request to claimed backlog issues", {
+              cause,
+            }),
+          ),
+        ),
+    });
 
   const commandId = (tag: string, threadId: ThreadId) =>
     crypto.randomUUIDv4.pipe(
@@ -212,6 +245,7 @@ const make = Effect.gen(function* () {
             Effect.catchTags({ OrchestrationCommandInvariantError: () => Effect.succeed(true) }),
             Effect.catchCause(dispatchFailure(PullRequestLinkFailedError)),
           );
+        yield* linkToClaimedIssues(thread, target.url);
         return { ...target, alreadyLinked };
       }),
     unlink_pull_request: (input) =>
