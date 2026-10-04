@@ -7,7 +7,13 @@ import type {
   EnvironmentId,
 } from "@t3tools/contracts";
 import { useNavigate } from "@tanstack/react-router";
-import { ChevronDownIcon, SquareKanbanIcon, ListFilterIcon, PencilIcon } from "lucide-react";
+import {
+  ChevronDownIcon,
+  SquareKanbanIcon,
+  ListFilterIcon,
+  PencilIcon,
+  WorkflowIcon,
+} from "lucide-react";
 import { useCallback, useMemo, useState } from "react";
 
 import { isElectron } from "../../env";
@@ -32,6 +38,7 @@ import {
 import { SidebarInset } from "../ui/sidebar";
 import { Skeleton } from "../ui/skeleton";
 import { stackedThreadToast, toastManager } from "../ui/toast";
+import { Toggle, ToggleGroup } from "../ui/toggle-group";
 import {
   WorkspaceBreadcrumb,
   WorkspaceBreadcrumbItem,
@@ -60,6 +67,7 @@ import {
   type PendingBacklogMove,
 } from "./backlog.logic";
 import { BacklogBoard } from "./BacklogBoard";
+import { BacklogGraph } from "./BacklogGraph";
 import { BacklogIssuePanel } from "./BacklogIssuePanel";
 import { BacklogInlineQuickAdd } from "./BacklogQuickAdd";
 import { useBacklogSwitcher } from "./useBacklogData";
@@ -68,6 +76,8 @@ export interface BacklogPageSearch {
   readonly scope?: string;
   readonly issueEnvironmentId?: EnvironmentId;
   readonly issueId?: BacklogIssueId;
+  /** Board when absent. */
+  readonly view?: "graph";
 }
 
 function entryLabel(entry: BacklogSwitcherEntry): string {
@@ -261,6 +271,26 @@ export function BacklogPage({
                   showWontfix={showWontfix}
                   onShowWontfix={setShowWontfix}
                 />
+                <ToggleGroup
+                  aria-label="Backlog view"
+                  variant="segmented"
+                  value={[search.view ?? "board"]}
+                  onValueChange={(value) => {
+                    const next = value[0];
+                    if (next === "board" || next === "graph") {
+                      updateSearch({ view: next === "graph" ? "graph" : undefined });
+                    }
+                  }}
+                >
+                  <Toggle aria-label="Board view" value="board">
+                    <SquareKanbanIcon aria-hidden />
+                    Board
+                  </Toggle>
+                  <Toggle aria-label="Dependency graph view" value="graph">
+                    <WorkflowIcon aria-hidden />
+                    Graph
+                  </Toggle>
+                </ToggleGroup>
               </div>
             </div>
 
@@ -307,6 +337,13 @@ export function BacklogPage({
               <BacklogEmpty
                 title="No matching issues"
                 description="Clear the filters to see the whole board."
+              />
+            ) : search.view === "graph" ? (
+              <BacklogGraph
+                columns={columns}
+                sources={scopeSources}
+                selectedKey={selectedKey}
+                onOpen={openIssue}
               />
             ) : (
               <BacklogBoard
