@@ -1,6 +1,9 @@
 import {
   AuthAccessReadScope,
   AuthAccessWriteScope,
+  AuthBacklogReadScope,
+  AuthBacklogWriteScope,
+  hasAuthScope,
   AuthStandardClientScopes,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
@@ -329,6 +332,8 @@ export const authHttpApiLayer = HttpApiBuilder.group(
                       AuthAccessWriteScope,
                       AuthRelayReadScope,
                       AuthRelayWriteScope,
+                      AuthBacklogReadScope,
+                      AuthBacklogWriteScope,
                     ]),
                   });
             if (requestedScopes === null) {
@@ -411,7 +416,7 @@ export const authHttpApiLayer = HttpApiBuilder.group(
               return yield* failEnvironmentInvalidRequest("invalid_scope");
             }
             for (const delegatedScope of delegatedScopes) {
-              if (!session.scopes.has(delegatedScope)) {
+              if (!hasAuthScope(session.scopes, delegatedScope)) {
                 return yield* failEnvironmentScopeRequired(delegatedScope);
               }
             }
