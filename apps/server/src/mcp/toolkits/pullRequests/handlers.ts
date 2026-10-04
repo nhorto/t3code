@@ -23,6 +23,7 @@ import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
+import * as BacklogService from "../../../backlog/BacklogService.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -155,6 +156,29 @@ const make = Effect.gen(function* () {
 
   const projects = yield* ProjectService.ProjectService;
   const crypto = yield* Crypto.Crypto;
+  // Optional so hosts without a backlog (and tests) keep linking pull requests.
+  const backlog = yield* Effect.serviceOption(BacklogService.BacklogService);
+
+  /** A linked pull request also lands on every backlog issue the thread holds; best-effort. */
+  const linkToClaimedIssues = (thread: OrchestrationV2ThreadShell, url: string) =>
+    Option.match(backlog, {
+      onNone: () => Effect.void,
+      onSome: (service) =>
+        McpInvocationContext.McpInvocationContext.pipe(
+          Effect.flatMap((scope) =>
+            service.linkPullRequestToClaims(
+              { url },
+              {
+                kind: "agent",
+                environmentId: scope.environmentId,
+                threadId: thread.id,
+                label: `${thread.title} · ${thread.modelSelection.model}`,
+              },
+            ),
+          ),
+          Effect.ignore,
+        ),
+    });
 
   const commandId = (tag: string, threadId: ThreadId) =>
     crypto.randomUUIDv4.pipe(
@@ -261,8 +285,10 @@ const make = Effect.gen(function* () {
         const existing = threadPullRequestsOf(thread).find((link) =>
           threadPullRequestKeysEqual(link, target),
         );
-        if (existing && existing.source !== "stack-dismissed")
+        if (existing && existing.source !== "stack-dismissed") {
+          yield* linkToClaimedIssues(thread, target.url);
           return { ...target, alreadyLinked: true };
+        }
         const alreadyLinked = yield* engine
           .dispatch({
             type: "thread.pull-request.link",
@@ -281,6 +307,7 @@ const make = Effect.gen(function* () {
 
             Effect.catchCause(dispatchFailure(PullRequestLinkFailedError)),
           );
+        yield* linkToClaimedIssues(thread, target.url);
         return { ...target, alreadyLinked };
       }),
     unlink_pull_request: (input) =>

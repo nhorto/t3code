@@ -629,6 +629,8 @@ function summaryActionPriority(action: ToolGroupAction | T3McpToolSummaryAction)
     case "attachment-prepare":
     case "attachment-discard":
     case "attachment-send":
+    case "backlog-write":
+    case "backlog-claim":
       return 0;
     case "other":
     case "update":

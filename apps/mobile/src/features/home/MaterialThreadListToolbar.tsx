@@ -29,6 +29,7 @@ export function MaterialThreadListToolbar(props: {
   readonly filterCustomized: boolean;
   readonly onFilterAction: NonNullable<ComponentProps<typeof ControlPillMenu>["onPressAction"]>;
   readonly onOpenSettings: () => void;
+  readonly onOpenBacklog?: () => void;
   readonly onOpenEnvironments: () => void;
   readonly sidebar?: boolean;
   readonly onLayout?: (event: LayoutChangeEvent) => void;
@@ -113,6 +114,13 @@ export function MaterialThreadListToolbar(props: {
                 icon="magnifyingglass"
                 onPress={openSearch}
               />
+              {props.onOpenBacklog ? (
+                <AndroidHeaderIconButton
+                  accessibilityLabel="Open backlog"
+                  icon="checklist"
+                  onPress={props.onOpenBacklog}
+                />
+              ) : null}
               <AndroidHeaderIconButton
                 accessibilityLabel="Open settings"
                 icon="gearshape"

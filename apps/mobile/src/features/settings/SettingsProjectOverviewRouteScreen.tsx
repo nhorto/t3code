@@ -3,12 +3,14 @@ import { AppText as Text, AppTextInput } from "../../components/AppText";
 import { ProjectFavicon } from "../../components/ProjectFavicon";
 import { deriveProjectGroupLabel } from "@t3tools/client-runtime/state/project-grouping";
 import type { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
+import { StackActions, useNavigation, type NavigationAction } from "@react-navigation/native";
 import { useState } from "react";
 import { Platform, Pressable, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { projectEnvironment } from "../../state/projects";
 import { useAtomCommand } from "../../state/use-atom-command";
+import { SettingsRow } from "./components/SettingsRow";
 import { SettingsScreen } from "./components/SettingsScreen";
 import { SettingsSection } from "./components/SettingsSection";
 import {
@@ -56,10 +58,23 @@ export function SettingsProjectOverviewRouteScreen() {
   );
 }
 
+/** Settings is a sheet over the workspace; the backlog replaces it in the root stack. */
+interface NavigatorChain {
+  readonly getParent: () => NavigatorChain | undefined;
+  readonly dispatch: (action: NavigationAction) => void;
+}
+
+function rootNavigation(navigation: NavigatorChain): NavigatorChain {
+  let current = navigation;
+  for (let parent = current.getParent(); parent; parent = parent.getParent()) current = parent;
+  return current;
+}
+
 function ProjectOverviewContent(props: {
   readonly members: readonly EnvironmentProject[];
   readonly environments: readonly SettingsTarget[];
 }) {
+  const navigation = useNavigation();
   const representative = props.members[0]!;
   const displayName = deriveProjectGroupLabel({ representative, members: props.members });
   const [draftName, setDraftName] = useState<string | null>(null);
@@ -137,6 +152,21 @@ function ProjectOverviewContent(props: {
             ) : null}
           </View>
         </View>
+      </SettingsSection>
+
+      <SettingsSection title="Planning">
+        <SettingsRow
+          icon="checklist"
+          label="Backlog"
+          onPress={() =>
+            rootNavigation(navigation).dispatch(
+              StackActions.replace("Backlog", {
+                environmentId: representative.environmentId,
+                projectId: representative.id,
+              }),
+            )
+          }
+        />
       </SettingsSection>
 
       <SettingsSection title="Checkouts">

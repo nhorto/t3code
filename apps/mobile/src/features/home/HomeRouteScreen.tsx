@@ -173,6 +173,8 @@ export function HomeRouteScreen() {
           options={{
             ...getConnectionAwareBrandHeaderOptions({
               headerWidth: windowWidth,
+              // Backlog and settings buttons.
+              trailingItemCount: 2,
               onOpenEnvironments: () =>
                 navigation.navigate("SettingsSheet", {
                   screen: "SettingsContent",
@@ -202,6 +204,7 @@ export function HomeRouteScreen() {
               params: { screen: "Settings" },
             })
           }
+          onOpenBacklog={() => navigation.navigate("Backlog")}
           onSearchQueryChange={setSearchQuery}
           onStartNewTask={() => navigation.navigate("NewTaskSheet", { screen: "NewTask" })}
         />

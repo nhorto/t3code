@@ -30,6 +30,7 @@ import IconBrain from "@tabler/icons-react-native/IconBrain";
 import IconCamera from "@tabler/icons-react-native/IconCamera";
 import IconChartBar from "@tabler/icons-react-native/IconChartBar";
 import IconCheck from "@tabler/icons-react-native/IconCheck";
+import IconChecklist from "@tabler/icons-react-native/IconChecklist";
 import IconCloud from "@tabler/icons-react-native/IconCloud";
 import IconChevronDown from "@tabler/icons-react-native/IconChevronDown";
 import IconChevronLeft from "@tabler/icons-react-native/IconChevronLeft";
@@ -144,6 +145,7 @@ const ANDROID_ICON_BY_SF_SYMBOL = {
   camera: IconCamera,
   "chart.bar.xaxis": IconChartBar,
   checkmark: IconCheck,
+  checklist: IconChecklist,
   "checkmark.circle": IconCircleCheck,
   circle: IconCircle,
   clock: IconClock,

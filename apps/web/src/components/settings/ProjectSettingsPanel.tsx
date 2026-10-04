@@ -10,7 +10,7 @@ import { AsyncResult } from "effect/unstable/reactivity";
 import { type EnvironmentId, type ProjectIconOverride } from "@t3tools/contracts";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import * as Cause from "effect/Cause";
-import { InfoIcon, Trash2Icon } from "lucide-react";
+import { InfoIcon, SquareKanbanIcon, Trash2Icon } from "lucide-react";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useComposerDraftStore } from "../../composerDraftStore";
@@ -486,6 +486,25 @@ function ProjectDetail({
                   Choose file
                 </Button>
               </div>
+            }
+          />
+          <SettingsRow
+            title="Backlog"
+            description="Ideas, bugs and features for this project, on a kanban board."
+            control={
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() =>
+                  void navigate({
+                    to: "/backlog",
+                    search: { scope: `project:${group.projectKey}` },
+                  })
+                }
+              >
+                <SquareKanbanIcon />
+                Open backlog
+              </Button>
             }
           />
         </SettingsSection>

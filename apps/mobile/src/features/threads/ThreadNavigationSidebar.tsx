@@ -89,6 +89,7 @@ interface ThreadNavigationSidebarProps {
   readonly visible: boolean;
   readonly selectedThreadKey: string | null;
   readonly onOpenSettings: () => void;
+  readonly onOpenBacklog: () => void;
   readonly onOpenEnvironmentSettings: () => void;
   readonly onNewThreadOnBranch: (thread: EnvironmentThreadShell) => void;
   readonly onNewThreadInProject: (project: EnvironmentProject) => void;
@@ -861,8 +862,9 @@ function ThreadNavigationSidebarPane(
         filterIcon,
         filterMenu,
         onOpenSettings: props.onOpenSettings,
+        onOpenBacklog: props.onOpenBacklog,
       }),
-    [filterIcon, filterMenu, props.onOpenSettings],
+    [filterIcon, filterMenu, props.onOpenBacklog, props.onOpenSettings],
   );
   // Snoozed threads need no special case: the shelf header is a list row
   // even while collapsed.
@@ -1036,6 +1038,7 @@ function ThreadNavigationSidebarPane(
           filterCustomized={filterCustomized}
           onFilterAction={handleListMenuAction}
           onOpenSettings={props.onOpenSettings}
+          onOpenBacklog={props.onOpenBacklog}
           onOpenEnvironments={props.onOpenEnvironmentSettings}
           onRequestVisibility={props.onRequestVisibility}
         />
@@ -1065,7 +1068,10 @@ function ThreadNavigationSidebarPane(
               <ControlPillMenu actions={listMenuActions} onPressAction={handleListMenuAction}>
                 <SidebarFilterButton accessibilityLabel="Filter threads" icon={filterIcon} />
               </ControlPillMenu>
-              <SidebarHeaderActions onOpenSettings={props.onOpenSettings} />
+              <SidebarHeaderActions
+                onOpenSettings={props.onOpenSettings}
+                onOpenBacklog={props.onOpenBacklog}
+              />
             </View>
           </View>
 

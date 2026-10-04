@@ -398,6 +398,15 @@ export function summarizeT3ToolCalls(
     case "capabilities":
       label = phrase("Checked", "check", `orchestration capabilities ${times}`);
       break;
+    case "backlog-read":
+      label = phrase("Checked", "check", `the backlog ${times}`);
+      break;
+    case "backlog-write":
+      label = phrase("Updated", "update", `the backlog ${times}`);
+      break;
+    case "backlog-claim":
+      label = phrase("Claimed or released", "claim", quantity(selected.length, "backlog issue"));
+      break;
   }
   return { label, failedCount };
 }

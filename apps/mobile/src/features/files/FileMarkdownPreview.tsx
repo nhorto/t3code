@@ -189,6 +189,35 @@ function useMarkdownPreviewStyles(renderImage?: MarkdownImageRenderer): Markdown
   ]);
 }
 
+/** Markdown in the app's reading typography, laid out inline in the caller's scroll view. */
+export function MarkdownContent(props: {
+  readonly markdown: string;
+  readonly renderImage?: MarkdownImageRenderer;
+}) {
+  const styles = useMarkdownPreviewStyles(props.renderImage);
+  const onLinkPress = useCallback((href: string) => {
+    void tryOpenExternalUrl(href, "markdown-link");
+  }, []);
+
+  return hasNativeSelectableMarkdownText() ? (
+    <SelectableMarkdownText
+      markdown={props.markdown}
+      onLinkPress={onLinkPress}
+      renderImage={props.renderImage}
+      textStyle={styles.nativeTextStyle}
+    />
+  ) : (
+    <Markdown
+      options={{ gfm: true }}
+      renderers={styles.renderers}
+      styles={styles.styles}
+      theme={styles.theme}
+    >
+      {props.markdown}
+    </Markdown>
+  );
+}
+
 export function FileMarkdownPreview(props: {
   readonly cwd: string;
   readonly captured?: boolean;
@@ -245,10 +274,6 @@ export function FileMarkdownPreview(props: {
     },
     [markdownDirectory, props.environmentId, props.threadId, props.captured],
   );
-  const styles = useMarkdownPreviewStyles(renderImage);
-  const onLinkPress = useCallback((href: string) => {
-    void tryOpenExternalUrl(href, "markdown-link");
-  }, []);
 
   return (
     <ScrollView
@@ -264,23 +289,7 @@ export function FileMarkdownPreview(props: {
       }
     >
       <View className="mx-auto w-full max-w-[760px]">
-        {hasNativeSelectableMarkdownText() ? (
-          <SelectableMarkdownText
-            markdown={props.markdown}
-            onLinkPress={onLinkPress}
-            renderImage={renderImage}
-            textStyle={styles.nativeTextStyle}
-          />
-        ) : (
-          <Markdown
-            options={{ gfm: true }}
-            renderers={styles.renderers}
-            styles={styles.styles}
-            theme={styles.theme}
-          >
-            {props.markdown}
-          </Markdown>
-        )}
+        <MarkdownContent markdown={props.markdown} renderImage={renderImage} />
       </View>
     </ScrollView>
   );

@@ -11,6 +11,10 @@ The \`t3-code\` MCP server provides app-owned orchestration. Treat these concept
 - For every T3 delegated review round, call \`delegate_task\` again. Include the original brief, prior findings, responses, and unresolved objections in each new task prompt. Track each round by its own \`taskId\`. Use a distinct \`clientRequestId\` per round, stable across retries of that round. Do not use \`t3_thread_send\` on \`childThreadId\` to continue a delegated review.
 - \`schedule_task\` creates persistent recurring work in the app scheduler. Pass \`schedule\` as a structured object, never as JSON text: \`{"type":"interval","everyMs":3600000}\` for an interval, or \`{"type":"fixed_time","timeOfDay":"09:00","weekdays":[1,2,3,4,5]}\` for a wall-clock schedule. By default runs return to the current thread; set \`bindToCurrentThread=false\` only when the user wants a fresh thread for every run. After scheduling, report the returned cadence and next run time.
 
+### Backlog
+
+The \`backlog_*\` tools are the user's issue board, shared by every agent on every machine. When the user asks to add an idea, bug, or feature to a project, call \`backlog_create_issue\` with the project's id from \`t3_project_list\` (no project means the Inbox). Before breaking a spec into work or working through a backlog, read \`backlog_guide\`. Claim an issue (\`backlog_claim\` or \`backlog_claim_next\`) before working on it, and release it with \`backlog_release\` when done.
+
 ### Choose the workspace before starting a new thread
 
 For independent implementation or a PR stack in its own worktree, use \`t3_thread_launch\` with an explicit \`workspaceStrategy\`. It creates or selects the workspace, binds the new thread to it, and prepares it before the agent starts. Put the task in \`message\`, not \`prompt\`:

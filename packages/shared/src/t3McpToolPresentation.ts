@@ -57,6 +57,9 @@ export type T3McpToolSummaryAction =
   | "list-prs"
   | "watch-pr"
   | "unwatch-pr"
+  | "backlog-read"
+  | "backlog-write"
+  | "backlog-claim"
   | "browser"
   | "device";
 
@@ -284,6 +287,31 @@ const T3_MCP_TOOLS: Readonly<Record<string, T3McpToolDefinition>> = {
     "attachment-discard",
   ),
   t3_thread_send_attachments: tool(["Send", "Sending", "Sent", "attachments"], "attachment-send"),
+  backlog_guide: tool(["Read", "Reading", "Read", "the backlog playbook"], "backlog-read"),
+  backlog_list_backlogs: tool(["List", "Listing", "Listed", "backlogs"], "backlog-read"),
+  backlog_list_issues: tool(["List", "Listing", "Listed", "backlog issues"], "backlog-read"),
+  backlog_get_issue: tool(["Read", "Reading", "Read", "a backlog issue"], "backlog-read"),
+  backlog_create_issue: tool(["Add", "Adding", "Added", "a backlog issue"], "backlog-write"),
+  backlog_create_children: tool(
+    ["Break down", "Breaking down", "Broke down", "a spec into issues"],
+    "backlog-write",
+  ),
+  backlog_update_issue: tool(["Update", "Updating", "Updated", "a backlog issue"], "backlog-write"),
+  backlog_comment: tool(
+    ["Comment on", "Commenting on", "Commented on", "an issue"],
+    "backlog-write",
+  ),
+  backlog_link_pull_request: tool(
+    ["Link", "Linking", "Linked", "a pull request to an issue"],
+    "backlog-write",
+    "pull-request",
+  ),
+  backlog_claim: tool(["Claim", "Claiming", "Claimed", "a backlog issue"], "backlog-claim"),
+  backlog_claim_next: tool(
+    ["Claim", "Claiming", "Claimed", "the next ready issue"],
+    "backlog-claim",
+  ),
+  backlog_release: tool(["Release", "Releasing", "Released", "a backlog issue"], "backlog-claim"),
 };
 
 /**

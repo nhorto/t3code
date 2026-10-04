@@ -194,6 +194,20 @@ export function CommandPalette(props: {
         run: () => navigation.navigate("NewTaskSheet", { screen: "AddProject" }),
       },
       {
+        key: "backlogQuickAdd",
+        kind: "action",
+        title: "Add to backlog",
+        searchTerms: ["idea", "bug", "issue", "capture", "inbox"],
+        run: () => navigation.navigate("BacklogQuickAdd"),
+      },
+      {
+        key: "backlog",
+        kind: "action",
+        title: "Open backlog",
+        searchTerms: ["issues", "board", "inbox", "todo"],
+        run: () => navigation.navigate("Backlog"),
+      },
+      {
         key: "settings",
         kind: "action",
         title: "Open settings",
@@ -280,6 +294,30 @@ export function CommandPalette(props: {
               projectId: activeProject.id,
               title: activeProject.title,
             },
+          }),
+      });
+    }
+    if (activeProject) {
+      actions.unshift({
+        key: "projectBacklogQuickAdd",
+        kind: "action",
+        title: `Add to ${activeProject.title} backlog`,
+        searchTerms: ["idea", "bug", "issue", "capture"],
+        run: () =>
+          navigation.navigate("BacklogQuickAdd", {
+            environmentId: activeProject.environmentId,
+            projectId: activeProject.id,
+          }),
+      });
+      actions.push({
+        key: "projectBacklog",
+        kind: "action",
+        title: `Backlog for ${activeProject.title}`,
+        searchTerms: ["issues", "board", "project"],
+        run: () =>
+          navigation.navigate("Backlog", {
+            environmentId: activeProject.environmentId,
+            projectId: activeProject.id,
           }),
       });
     }

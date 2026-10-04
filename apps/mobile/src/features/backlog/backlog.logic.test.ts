@@ -1,0 +1,395 @@
+import { EMPTY_BACKLOG_BOARD, type BacklogBoardState } from "@t3tools/client-runtime/state/backlog";
+import {
+  BacklogId,
+  BacklogIssueId,
+  EnvironmentId,
+  ProjectId,
+  type Backlog,
+  type BacklogIssue,
+} from "@t3tools/contracts";
+import { describe, expect, it } from "vite-plus/test";
+
+import {
+  backlogMoveTargets,
+  buildBacklogListItems,
+  buildBacklogScopes,
+  defaultQuickAddScopeKey,
+  describeBacklogClaim,
+  filterBacklogIssues,
+  findBacklogScopeForProject,
+  mergeBacklogIssuesById,
+  reopenBacklogStatus,
+  resolveBacklogCreateTarget,
+  resolveBacklogScope,
+  selectBacklogScopeIssues,
+  type BacklogProjectGroup,
+  type EnvironmentBacklogBoard,
+} from "./backlog.logic";
+
+const GEEKOM = EnvironmentId.make("geekom");
+const LAPTOP = EnvironmentId.make("laptop");
+const WINE_ON_GEEKOM = ProjectId.make("wine-geekom");
+const WINE_ON_LAPTOP = ProjectId.make("wine-laptop");
+const NOTES_ON_LAPTOP = ProjectId.make("notes-laptop");
+const AT = "2026-10-04T10:00:00.000Z";
+
+function backlog(
+  id: string,
+  kind: Backlog["kind"],
+  title: string,
+  projectId: ProjectId | null = null,
+  repositoryKey: string | null = null,
+): Backlog {
+  return {
+    id: BacklogId.make(id),
+    kind,
+    key: kind === "inbox" ? "INBOX" : title.toUpperCase().slice(0, 4),
+    title,
+    projectId,
+    repositoryKey,
+    createdAt: AT,
+    updatedAt: AT,
+  } as Backlog;
+}
+
+function issue(
+  id: string,
+  backlogId: string,
+  overrides: Partial<Omit<BacklogIssue, "id" | "backlogId">> = {},
+): BacklogIssue {
+  return {
+    id: BacklogIssueId.make(id),
+    backlogId: BacklogId.make(backlogId),
+    number: 1,
+    key: `KEY-${id}`,
+    title: `Issue ${id}`,
+    type: "idea",
+    status: "backlog",
+    priority: null,
+    parentId: null,
+    blockedBy: [],
+    claim: null,
+    links: [],
+    hasBody: false,
+    createdBy: { kind: "user", environmentId: null, threadId: null, label: "Nick" },
+    createdAt: AT,
+    updatedAt: AT,
+    closedAt: null,
+    ...overrides,
+  } as BacklogIssue;
+}
+
+function board(backlogs: Backlog[], issues: BacklogIssue[]): BacklogBoardState {
+  return { backlogs, issues, issuesById: new Map(issues.map((entry) => [entry.id, entry])) };
+}
+
+const wineGroup: BacklogProjectGroup = {
+  key: "repo:wine",
+  label: "Cork & Note",
+  projectRefs: [
+    { environmentId: GEEKOM, projectId: WINE_ON_GEEKOM },
+    { environmentId: LAPTOP, projectId: WINE_ON_LAPTOP },
+  ],
+  repositoryKeys: ["github.com/nhorto/cork-and-note"],
+};
+const notesGroup: BacklogProjectGroup = {
+  key: "repo:notes",
+  label: "Notes",
+  projectRefs: [{ environmentId: LAPTOP, projectId: NOTES_ON_LAPTOP }],
+  repositoryKeys: [],
+};
+
+describe("buildBacklogScopes", () => {
+  it("lists All and Inbox first, then projects alphabetically, merging environments", () => {
+    const boards: EnvironmentBacklogBoard[] = [
+      {
+        environmentId: GEEKOM,
+        board: board(
+          [
+            backlog("inbox-g", "inbox", "Inbox"),
+            backlog("wine", "project", "Cork & Note", WINE_ON_GEEKOM),
+          ],
+          [],
+        ),
+      },
+      { environmentId: LAPTOP, board: board([backlog("inbox-l", "inbox", "Inbox")], []) },
+    ];
+    const scopes = buildBacklogScopes({ boards, projectGroups: [notesGroup, wineGroup] });
+
+    expect(scopes.map((scope) => scope.label)).toEqual([
+      "All backlogs",
+      "Inbox",
+      "Cork & Note",
+      "Notes",
+    ]);
+    expect(scopes[1]!.backlogs.map((entry) => entry.backlog.id)).toEqual(["inbox-g", "inbox-l"]);
+    expect(scopes[2]!.backlogs.map((entry) => entry.backlog.id)).toEqual(["wine"]);
+    expect(scopes[3]!.backlogs).toEqual([]);
+  });
+
+  it("matches a backlog homed on another machine by repository", () => {
+    const homed = backlog(
+      "wine",
+      "project",
+      "Cork & Note",
+      ProjectId.make("project-on-a-machine-we-do-not-list"),
+      "github.com/nhorto/cork-and-note",
+    );
+    const scopes = buildBacklogScopes({
+      boards: [{ environmentId: GEEKOM, board: board([homed], []) }],
+      projectGroups: [wineGroup],
+    });
+
+    expect(scopes.map((scope) => scope.label)).toEqual(["All backlogs", "Inbox", "Cork & Note"]);
+    expect(scopes[2]!.backlogs.map((entry) => entry.backlog.id)).toEqual(["wine"]);
+  });
+
+  it("keeps a backlog whose project is gone reachable under its own entry", () => {
+    const orphan = backlog("old", "project", "Old project", ProjectId.make("deleted"));
+    const scopes = buildBacklogScopes({
+      boards: [{ environmentId: GEEKOM, board: board([orphan], []) }],
+      projectGroups: [],
+    });
+
+    expect(scopes.map((scope) => scope.label)).toEqual(["All backlogs", "Inbox", "Old project"]);
+    expect(scopes[2]!.backlogs.map((entry) => entry.backlog.id)).toEqual(["old"]);
+  });
+
+  it("finds a project's scope from any of its checkouts and falls back to All", () => {
+    const scopes = buildBacklogScopes({ boards: [], projectGroups: [wineGroup] });
+
+    expect(
+      findBacklogScopeForProject(scopes, { environmentId: LAPTOP, projectId: WINE_ON_LAPTOP })
+        ?.label,
+    ).toBe("Cork & Note");
+    expect(resolveBacklogScope(scopes, "missing").key).toBe("all");
+  });
+});
+
+describe("selectBacklogScopeIssues", () => {
+  const boards: EnvironmentBacklogBoard[] = [
+    {
+      environmentId: GEEKOM,
+      board: board(
+        [backlog("inbox-g", "inbox", "Inbox"), backlog("wine", "project", "Wine", WINE_ON_GEEKOM)],
+        [issue("a", "inbox-g"), issue("b", "wine")],
+      ),
+    },
+    {
+      environmentId: LAPTOP,
+      // The same issue reported twice is shown once.
+      board: board(
+        [backlog("inbox-l", "inbox", "Inbox")],
+        [issue("c", "inbox-l"), issue("b", "wine")],
+      ),
+    },
+  ];
+  const scopes = buildBacklogScopes({ boards, projectGroups: [wineGroup] });
+
+  it("shows every issue once for All", () => {
+    const ids = selectBacklogScopeIssues(boards, resolveBacklogScope(scopes, "all")).map(
+      (entry) => entry.issue.id,
+    );
+    expect(ids).toEqual(["a", "b", "c"]);
+  });
+
+  it("limits the Inbox and a project to their backlogs", () => {
+    expect(
+      selectBacklogScopeIssues(boards, resolveBacklogScope(scopes, "inbox")).map(
+        (entry) => entry.issue.id,
+      ),
+    ).toEqual(["a", "c"]);
+    expect(
+      selectBacklogScopeIssues(boards, resolveBacklogScope(scopes, "project:repo:wine")).map(
+        (entry) => `${entry.environmentId}/${entry.issue.id}`,
+      ),
+    ).toEqual(["geekom/b"]);
+  });
+});
+
+describe("filterBacklogIssues", () => {
+  const entries = [
+    {
+      environmentId: GEEKOM,
+      issue: issue("1", "x", { key: "WINE-12", title: "Paywall crashes on iPad", type: "bug" }),
+    },
+    {
+      environmentId: GEEKOM,
+      issue: issue("2", "x", { key: "WINE-13", title: "Dark mode labels" }),
+    },
+  ];
+
+  it("matches every word against the key or title", () => {
+    expect(filterBacklogIssues(entries, { query: "ipad paywall", type: null })).toHaveLength(1);
+    expect(filterBacklogIssues(entries, { query: "wine-13", type: null })[0]!.issue.id).toBe("2");
+  });
+
+  it("filters by type", () => {
+    expect(
+      filterBacklogIssues(entries, { query: "", type: "bug" }).map((entry) => entry.issue.id),
+    ).toEqual(["1"]);
+  });
+});
+
+describe("buildBacklogListItems", () => {
+  const issues = [
+    issue("ready-old", "x", { status: "ready", updatedAt: "2026-10-01T00:00:00.000Z" }),
+    issue("ready-new", "x", {
+      status: "ready",
+      updatedAt: "2026-10-03T00:00:00.000Z",
+      blockedBy: [BacklogIssueId.make("ready-old")],
+    }),
+    issue("done", "x", { status: "done" }),
+  ];
+  const entries = issues.map((entry) => ({ environmentId: GEEKOM, issue: entry }));
+  const issuesById = new Map(issues.map((entry) => [entry.id, entry]));
+
+  it("groups by status in board order, skips empty columns and collapses closed ones", () => {
+    const items = buildBacklogListItems({ entries, issuesById, expandedClosedStatuses: new Set() });
+
+    expect(
+      items.map((item) =>
+        item.type === "section" ? `[${item.label} ${item.count}]` : item.entry.issue.id,
+      ),
+    ).toEqual(["[Ready 2]", "ready-new", "ready-old", "[Done 1]"]);
+    expect(items.find((item) => item.type === "section" && item.status === "done")).toMatchObject({
+      collapsed: true,
+    });
+  });
+
+  it("marks issues blocked by an open issue and expands closed columns on request", () => {
+    const items = buildBacklogListItems({
+      entries,
+      issuesById,
+      expandedClosedStatuses: new Set(["done"]),
+    });
+    const blocked = items.flatMap((item) =>
+      item.type === "issue" && item.blocked ? [item.entry.issue.id] : [],
+    );
+
+    expect(blocked).toEqual(["ready-new"]);
+    expect(items.at(-1)).toMatchObject({ type: "issue", isFirst: true, isLast: true });
+  });
+
+  it("resolves blockers across environments", () => {
+    const other = issue("blocker", "y", { status: "in_progress" });
+    const merged = mergeBacklogIssuesById([
+      { environmentId: GEEKOM, board: board([], [issues[1]!]) },
+      { environmentId: LAPTOP, board: board([], [other]) },
+    ]);
+    expect([...merged.keys()]).toEqual(["ready-new", "blocker"]);
+  });
+});
+
+describe("resolveBacklogCreateTarget", () => {
+  const boards: EnvironmentBacklogBoard[] = [
+    {
+      environmentId: GEEKOM,
+      board: board(
+        [backlog("inbox-g", "inbox", "Inbox"), backlog("wine", "project", "Wine", WINE_ON_GEEKOM)],
+        [],
+      ),
+    },
+    { environmentId: LAPTOP, board: EMPTY_BACKLOG_BOARD },
+  ];
+  const scopes = buildBacklogScopes({ boards, projectGroups: [wineGroup, notesGroup] });
+
+  it("sends Inbox ideas to the environment hosting an Inbox", () => {
+    expect(
+      resolveBacklogCreateTarget(resolveBacklogScope(scopes, "inbox"), [LAPTOP, GEEKOM]),
+    ).toEqual({
+      environmentId: GEEKOM,
+      input: { backlogId: "inbox-g" },
+    });
+  });
+
+  it("creates the Inbox on the first connected environment when none exists", () => {
+    const empty = buildBacklogScopes({ boards: [], projectGroups: [] });
+    expect(resolveBacklogCreateTarget(resolveBacklogScope(empty, "all"), [LAPTOP])).toEqual({
+      environmentId: LAPTOP,
+      input: {},
+    });
+    expect(resolveBacklogCreateTarget(resolveBacklogScope(empty, "inbox"), [])).toBeNull();
+  });
+
+  it("uses the project's existing backlog, else a connected checkout", () => {
+    expect(
+      resolveBacklogCreateTarget(resolveBacklogScope(scopes, "project:repo:wine"), [
+        LAPTOP,
+        GEEKOM,
+      ]),
+    ).toEqual({ environmentId: GEEKOM, input: { backlogId: "wine" } });
+    expect(
+      resolveBacklogCreateTarget(resolveBacklogScope(scopes, "project:repo:wine"), [LAPTOP]),
+    ).toEqual({ environmentId: LAPTOP, input: { projectId: WINE_ON_LAPTOP } });
+    expect(
+      resolveBacklogCreateTarget(resolveBacklogScope(scopes, "project:repo:notes"), [GEEKOM]),
+    ).toBeNull();
+  });
+
+  it("defaults quick-add to the board's project, else the Inbox", () => {
+    expect(defaultQuickAddScopeKey(resolveBacklogScope(scopes, "project:repo:wine"))).toBe(
+      "project:repo:wine",
+    );
+    expect(defaultQuickAddScopeKey(resolveBacklogScope(scopes, "all"))).toBe("inbox");
+  });
+});
+
+describe("issue actions", () => {
+  it("offers the Inbox, then every project on the environment, creating backlogs as needed", () => {
+    const wine = ProjectId.make("wine");
+    const notes = ProjectId.make("notes");
+    const apps = ProjectId.make("apps");
+    const state = board(
+      [
+        backlog("inbox", "inbox", "Inbox"),
+        backlog("wine-backlog", "project", "Wine", wine),
+        backlog("apps-backlog", "project", "Apps", apps),
+        backlog("old", "project", "Old project", ProjectId.make("deleted")),
+      ],
+      [],
+    );
+    const projects = [
+      { id: wine, title: "Cork & Note" },
+      { id: notes, title: "Notes" },
+      { id: apps, title: "Apps" },
+    ];
+
+    const fromInbox = backlogMoveTargets(state, { backlogId: BacklogId.make("inbox") }, projects);
+    expect(fromInbox.map((target) => [target.label, target.patch])).toEqual([
+      ["Apps", { backlogId: "apps-backlog" }],
+      ["Cork & Note", { backlogId: "wine-backlog" }],
+      ["Notes", { projectId: "notes" }],
+      ["Old project", { backlogId: "old" }],
+    ]);
+
+    const fromWine = backlogMoveTargets(
+      state,
+      { backlogId: BacklogId.make("wine-backlog") },
+      projects,
+    );
+    expect(fromWine.map((target) => target.label)).toEqual([
+      "Inbox",
+      "Apps",
+      "Notes",
+      "Old project",
+    ]);
+  });
+
+  it("reopens to the column the issue would have started in", () => {
+    expect(reopenBacklogStatus(backlog("inbox", "inbox", "Inbox"))).toBe("inbox");
+    expect(reopenBacklogStatus(backlog("wine", "project", "Wine"))).toBe("backlog");
+  });
+
+  it("describes a claim by holder and machine", () => {
+    const claim = {
+      actor: { kind: "agent" as const, environmentId: GEEKOM, threadId: null, label: "Claude" },
+      claimedAt: AT,
+      leaseExpiresAt: AT,
+    };
+    expect(describeBacklogClaim(claim, (id) => (id === GEEKOM ? "Geekom" : null))).toBe(
+      "Claude · Geekom",
+    );
+    expect(describeBacklogClaim(claim, () => null)).toBe("Claude");
+  });
+});

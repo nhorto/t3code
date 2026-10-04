@@ -119,6 +119,7 @@ import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts"
 import * as ThreadMessageIntake from "./orchestration-v2/ThreadMessageIntake.ts";
 import * as IdAllocator from "./orchestration-v2/IdAllocator.ts";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
+import * as BacklogService from "./backlog/BacklogService.ts";
 import {
   archivedShellStreamItemFromThreadShell,
   buildActiveShellSnapshot,
@@ -1215,6 +1216,7 @@ const makeWsRpcLayer = (
       const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
       const providerSessionManager = yield* ProviderSessionManager.ProviderSessionManagerV2;
       const scheduledTasks = yield* ScheduledTasks.ScheduledTaskService;
+      const backlog = yield* BacklogService.BacklogService;
       const pullRequests = yield* PullRequestService.PullRequestService;
       const pullRequestSync = yield* PullRequestSyncReactor.PullRequestSyncReactor;
       const deviceService = yield* DeviceService.DeviceService;
@@ -1275,6 +1277,13 @@ const makeWsRpcLayer = (
       const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
       const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
+      // Clients act as the user of this environment; agents reach the backlog through MCP.
+      const backlogUser = {
+        kind: "user" as const,
+        environmentId: yield* serverEnvironment.getEnvironmentId,
+        threadId: null,
+        label: "You",
+      };
       const backgroundPolicy = yield* BackgroundPolicy.BackgroundPolicy;
       const rpcClientIds = yield* Ref.make(new Set<RpcClientId>());
       yield* Effect.addFinalizer(() =>
@@ -2062,6 +2071,40 @@ const makeWsRpcLayer = (
             "rpc.aggregate": "scheduledTasks",
             "scheduled_task.id": input.id,
           }),
+        [WS_METHODS.backlogSubscribe]: (_input) =>
+          observeRpcStream(WS_METHODS.backlogSubscribe, backlog.subscribe(), {
+            "rpc.aggregate": "backlog",
+          }),
+        [WS_METHODS.backlogGetIssue]: (input) =>
+          observeRpcEffect(WS_METHODS.backlogGetIssue, backlog.getIssue(input), {
+            "rpc.aggregate": "backlog",
+            "backlog.issue_id": input.issueId,
+          }),
+        [WS_METHODS.backlogCreateIssue]: (input) =>
+          observeRpcEffect(WS_METHODS.backlogCreateIssue, backlog.createIssue(input, backlogUser), {
+            "rpc.aggregate": "backlog",
+          }),
+        [WS_METHODS.backlogUpdateIssue]: (input) =>
+          observeRpcEffect(WS_METHODS.backlogUpdateIssue, backlog.updateIssue(input, backlogUser), {
+            "rpc.aggregate": "backlog",
+            "backlog.issue_id": input.issueId,
+          }),
+        [WS_METHODS.backlogComment]: (input) =>
+          observeRpcEffect(WS_METHODS.backlogComment, backlog.comment(input, backlogUser), {
+            "rpc.aggregate": "backlog",
+            "backlog.issue_id": input.issueId,
+          }),
+        [WS_METHODS.backlogRelease]: (input) =>
+          observeRpcEffect(WS_METHODS.backlogRelease, backlog.release(input, backlogUser), {
+            "rpc.aggregate": "backlog",
+            "backlog.issue_id": input.issueId,
+          }),
+        [WS_METHODS.backlogUpdateBacklog]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.backlogUpdateBacklog,
+            backlog.updateBacklog(input, backlogUser),
+            { "rpc.aggregate": "backlog" },
+          ),
         [WS_METHODS.serverProbe]: (_input) =>
           observeRpcEffect(WS_METHODS.serverProbe, Effect.succeed({}), {
             "rpc.aggregate": "server",

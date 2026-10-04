@@ -29,6 +29,9 @@ import {
   type RenderFailureProps,
 } from "./components/RenderErrorBoundary";
 import { ArchivedThreadsRouteScreen } from "./features/archive/ArchivedThreadsRouteScreen";
+import { BacklogIssueRouteScreen } from "./features/backlog/BacklogIssueRouteScreen";
+import { BacklogQuickAddSheet } from "./features/backlog/BacklogQuickAddSheet";
+import { BacklogRouteScreen } from "./features/backlog/BacklogRouteScreen";
 import { useAgentNotificationNavigation } from "./features/agent-awareness/notificationNavigation";
 import { ConnectOnboardingRouteScreen } from "./features/cloud/ConnectOnboardingRouteScreen";
 import { useConnectOnboardingNavigation } from "./features/cloud/connectOnboardingNavigation";
@@ -534,6 +537,7 @@ const NewTaskSheetStack = createNativeStackNavigator({
 // influence the adaptive workspace layout: opening Settings over Home should
 // not flip the sidebar in or change the active thread.
 const WORKSPACE_OVERLAY_ROUTES = new Set([
+  "BacklogQuickAdd",
   "ConnectOnboarding",
   "Connections",
   "ConnectionsNew",
@@ -815,6 +819,29 @@ const RootStackConfig = createNativeStackNavigator({
         ...FORM_SHEET_PRESENTATION_OPTIONS,
         sheetAllowedDetents: [0.45, 0.7],
         sheetGrabberVisible: true,
+      },
+    }),
+    Backlog: createNativeStackScreen({
+      screen: BacklogRouteScreen,
+      linking: "backlog",
+      options: GLASS_HEADER_OPTIONS,
+    }),
+    BacklogIssue: createNativeStackScreen({
+      screen: BacklogIssueRouteScreen,
+      linking: "backlog/:environmentId/:issueId",
+      options: GLASS_HEADER_OPTIONS,
+    }),
+    BacklogQuickAdd: createNativeStackScreen({
+      screen: BacklogQuickAddSheet,
+      linking: "backlog/new",
+      options: {
+        // Like the review comment composer: Android cannot host a
+        // keyboard-driven form inside a formSheet.
+        ...(Platform.OS === "android"
+          ? { presentation: "fullScreenModal" as const }
+          : FORM_SHEET_PRESENTATION_OPTIONS),
+        sheetAllowedDetents: Platform.OS === "android" ? undefined : [0.6, 0.92],
+        sheetGrabberVisible: Platform.OS !== "android",
       },
     }),
     SettingsSheet: createNativeStackScreen({

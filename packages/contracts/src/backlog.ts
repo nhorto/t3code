@@ -64,6 +64,11 @@ export const Backlog = Schema.Struct({
   title: TrimmedNonEmptyString,
   /** Null for the Inbox. */
   projectId: Schema.NullOr(ProjectId),
+  /**
+   * The project's repository canonicalKey when it has one. Project ids are local to an
+   * environment; this is how other machines find the backlog for the same repository.
+   */
+  repositoryKey: Schema.NullOr(TrimmedNonEmptyString),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -219,6 +224,10 @@ export const BacklogUpdateIssueInput = Schema.Struct({
   }),
   backlogId: Schema.optional(BacklogId).annotate({
     description: "Move the issue to another backlog, e.g. triaging from the Inbox to a project.",
+  }),
+  projectId: Schema.optional(ProjectId).annotate({
+    description:
+      "Move the issue to this project's backlog, creating it on first use. Ignored when backlogId is set.",
   }),
 });
 export type BacklogUpdateIssueInput = typeof BacklogUpdateIssueInput.Type;

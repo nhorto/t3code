@@ -422,6 +422,10 @@ function AdaptiveWorkspaceLayoutContent(
     });
   }, [navigation]);
 
+  const handleOpenBacklog = useCallback(() => {
+    navigation.navigate("Backlog");
+  }, [navigation]);
+
   const handleStartNewTask = useCallback(() => {
     navigation.navigate("NewTaskSheet", { screen: "NewTask" });
   }, [navigation]);
@@ -597,6 +601,7 @@ function AdaptiveWorkspaceLayoutContent(
                       onRequestVisibility={revealPrimarySidebar}
                       selectedThreadKey={selectedThreadKey}
                       onOpenSettings={handleOpenSettings}
+                      onOpenBacklog={handleOpenBacklog}
                       onOpenEnvironmentSettings={handleOpenEnvironmentSettings}
                       onNewThreadInProject={handleNewThreadInProject}
                       onNewThreadOnBranch={handleNewThreadOnBranch}
