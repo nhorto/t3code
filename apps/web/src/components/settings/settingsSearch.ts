@@ -19,6 +19,7 @@ export type SettingsPath =
   | "/settings/snap-shot"
   | "/settings/providers"
   | "/settings/integrations"
+  | "/settings/backlog"
   | "/settings/source-control"
   | "/settings/storage"
   | "/settings/connections"
@@ -90,6 +91,7 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
   "/settings/snap-shot": "SnapShots",
   "/settings/providers": "Providers",
   "/settings/integrations": "Integrations",
+  "/settings/backlog": "Backlog",
   "/settings/source-control": "Source Control",
   "/settings/storage": "Storage",
   "/settings/connections": "Connections",
@@ -129,6 +131,14 @@ const KEYBINDING_SEARCH_ITEMS = STATIC_KEYBINDING_COMMANDS.toSorted((left, right
  * that may not be mounted point at their nearest stable section instead.
  */
 export const SETTINGS_SEARCH_ITEMS = [
+  {
+    id: "backlog-hub-link",
+    title: "Backlog hub",
+    to: "/settings/backlog",
+    searchTerms: [
+      "fleet link backlog hub spoke default host geekom pairing machines agents claim issues",
+    ],
+  },
   {
     id: "storage-worktrees",
     title: "Worktree cleanup",
@@ -858,6 +868,7 @@ const SETTINGS_CATEGORY_SCOPES: Readonly<Record<SettingsPath, SettingsSearchScop
   "/settings/source-control": "environment-defaults",
   "/settings/storage": "project-defaults",
   "/settings/connections": "connections",
+  "/settings/backlog": "connections",
   "/settings/archived": "project-defaults",
 };
 

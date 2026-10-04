@@ -22,6 +22,9 @@ import {
   AuthAccessReadScope,
   AuthAccessWriteScope,
   AuthAdministrativeScopes,
+  AuthBacklogLinkScopes,
+  AuthBacklogReadScope,
+  AuthBacklogWriteScope,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   AuthRelayReadScope,
@@ -250,6 +253,16 @@ const PAIRING_SCOPE_OPTIONS: ReadonlyArray<{
     scope: AuthRelayWriteScope,
     title: "Manage relay",
     description: "Change managed tunnel connectivity.",
+  },
+  {
+    scope: AuthBacklogReadScope,
+    title: "Read backlogs",
+    description: "Read backlogs and issues. Granted by View environment too.",
+  },
+  {
+    scope: AuthBacklogWriteScope,
+    title: "Work backlogs",
+    description: "Create, claim, and update issues. Granted by Operate tasks too.",
   },
 ];
 
@@ -1170,6 +1183,14 @@ const AuthorizedClientsHeaderAction = memo(function AuthorizedClientsHeaderActio
                     onClick={() => setPairingScopes([...AuthStandardClientScopes])}
                   >
                     Standard
+                  </Button>
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    disabled={isCreatingPairingLink}
+                    onClick={() => setPairingScopes([...AuthBacklogLinkScopes])}
+                  >
+                    Backlog link
                   </Button>
                 </div>
               </div>

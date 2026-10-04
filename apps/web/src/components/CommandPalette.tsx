@@ -47,6 +47,7 @@ import {
   ArrowLeftIcon,
   ChartNoAxesColumnIcon,
   CheckIcon,
+  SquareKanbanIcon,
   ChevronRightIcon,
   CornerLeftUpIcon,
   FileSearchIcon,
@@ -208,6 +209,7 @@ import {
 } from "../sidebarProjectGrouping";
 import type { Project } from "../types";
 import { PullRequestGlyph } from "~/components/pullRequest/pullRequestIcons";
+import { openBacklogQuickAdd } from "~/components/backlog/BacklogQuickAdd";
 import { readPullRequestListPreferences } from "~/components/pullRequest/pullRequestListPreferences";
 
 const EMPTY_BROWSE_ENTRIES: FilesystemBrowseResult["entries"] = [];
@@ -581,6 +583,14 @@ export function CommandPalette({ children }: { children: ReactNode }) {
         event.stopPropagation();
         setOpen(false);
         void navigate({ to: "/usage" });
+        return;
+      }
+      if (command === "backlog.quickAdd") {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.repeat) return;
+        setOpen(false);
+        openBacklogQuickAdd();
         return;
       }
       const mode = overlayModeForCommand(command);
@@ -2228,6 +2238,29 @@ function OpenCommandPaletteDialog(props: {
       },
     });
   }
+
+  actionItems.push({
+    kind: "action",
+    value: "action:backlog-add",
+    searchTerms: ["backlog", "add", "issue", "idea", "bug", "feature", "capture", "todo", "inbox"],
+    title: "Add to backlog",
+    icon: <SquareKanbanIcon className={ITEM_ICON_CLASS} />,
+    shortcutCommand: "backlog.quickAdd",
+    run: async () => {
+      openBacklogQuickAdd();
+    },
+  });
+
+  actionItems.push({
+    kind: "action",
+    value: "action:backlog",
+    searchTerms: ["backlog", "kanban", "board", "issues", "inbox", "planning", "tasks"],
+    title: "Open backlog",
+    icon: <SquareKanbanIcon className={ITEM_ICON_CLASS} />,
+    run: async () => {
+      await navigate({ to: "/backlog" });
+    },
+  });
 
   actionItems.push({
     kind: "action",

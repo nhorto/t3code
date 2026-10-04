@@ -1,10 +1,11 @@
-import { ArrowLeftIcon, ChartNoAxesColumnIcon, SettingsIcon } from "lucide-react";
+import { ArrowLeftIcon, ChartNoAxesColumnIcon, SettingsIcon, SquareKanbanIcon } from "lucide-react";
 import type { ReactNode } from "react";
 import { memo, useCallback } from "react";
 import { Link, useLocation, useNavigate } from "@tanstack/react-router";
 
 import { useEnvironmentIdentificationMode } from "../../hooks/useSettings";
 import { cn } from "../../lib/utils";
+import { useHeldAgentMessageCount } from "../../state/agentMessages";
 import { useEnvironments } from "../../state/environments";
 import { T3Wordmark } from "../T3Wordmark";
 import {
@@ -105,23 +106,36 @@ function SidebarUtilityItem({
   icon,
   label,
   onClick,
+  attention,
 }: {
   icon: ReactNode;
   label: string;
   onClick: () => void;
+  /** A count that needs the user, shown on the icon and in the label. */
+  attention?: { readonly count: number; readonly label: string } | undefined;
 }) {
+  const fullLabel =
+    attention && attention.count > 0 ? `${label}, ${attention.count} ${attention.label}` : label;
   return (
-    <SidebarMenuItem className="shrink-0">
+    <SidebarMenuItem className="relative shrink-0">
       <Tooltip>
         <TooltipTrigger
           render={
-            <SidebarMenuButton aria-label={label} onClick={onClick} size="icon">
+            <SidebarMenuButton aria-label={fullLabel} onClick={onClick} size="icon">
               {icon}
             </SidebarMenuButton>
           }
         />
-        <TooltipPopup side="top">{label}</TooltipPopup>
+        <TooltipPopup side="top">{fullLabel}</TooltipPopup>
       </Tooltip>
+      {attention && attention.count > 0 ? (
+        <span
+          aria-hidden
+          className="pointer-events-none absolute -top-0.5 -right-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-warning px-1 text-3xs leading-none font-medium text-warning-foreground tabular-nums"
+        >
+          {attention.count > 99 ? "99+" : attention.count}
+        </span>
+      ) : null}
     </SidebarMenuItem>
   );
 }
@@ -139,6 +153,7 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
   const pullRequestsSupported = environments.some(
     (environment) => environment.serverConfig?.environment.capabilities.pullRequests === true,
   );
+  const heldAgentMessages = useHeldAgentMessageCount();
   const closeMobileSidebar = useCallback(() => {
     if (isMobile) {
       setOpenMobile(false);
@@ -151,6 +166,11 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
       search: readPullRequestListPreferences(),
     });
   }, [closeMobileSidebar, navigate]);
+  const handleBacklogClick = useCallback(() => {
+    closeMobileSidebar();
+    // Held messages wait for the user, so open straight onto them.
+    void navigate({ to: "/backlog", search: heldAgentMessages > 0 ? { messages: true } : {} });
+  }, [closeMobileSidebar, heldAgentMessages, navigate]);
   const handleSettingsClick = useCallback(() => {
     closeMobileSidebar();
     void navigate({ to: "/settings" });
@@ -191,6 +211,12 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
               onClick={handlePullRequestsClick}
             />
           ) : null}
+          <SidebarUtilityItem
+            icon={<SquareKanbanIcon />}
+            label="Backlog"
+            onClick={handleBacklogClick}
+            attention={{ count: heldAgentMessages, label: "held agent messages" }}
+          />
           <SidebarUtilityItem
             icon={<ChartNoAxesColumnIcon />}
             label="Usage"

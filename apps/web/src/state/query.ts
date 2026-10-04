@@ -7,10 +7,12 @@ const EMPTY_ASYNC_RESULT_ATOM = Atom.make(AsyncResult.initial<never, never>(fals
   Atom.withLabel("web-environment-query:empty"),
 );
 
-export interface EnvironmentQueryView<A> {
+export interface EnvironmentQueryView<A, E = unknown> {
   readonly data: A | null;
   readonly dataUpdatedAt: number | null;
   readonly error: string | null;
+  /** The typed failure, when the query failed with one; lets callers branch on its `_tag`. */
+  readonly failure: E | null;
   readonly isPending: boolean;
   readonly isSuccess: boolean;
   readonly refresh: () => void;
@@ -25,7 +27,7 @@ export function formatEnvironmentQueryError(cause: Cause.Cause<unknown>): string
 
 export function useEnvironmentQuery<A, E>(
   atom: Atom.Atom<AsyncResult.AsyncResult<A, E>> | null,
-): EnvironmentQueryView<A> {
+): EnvironmentQueryView<A, E> {
   const selectedAtom = atom ?? EMPTY_ASYNC_RESULT_ATOM;
   const result = useAtomValue(selectedAtom);
   const refresh = useAtomRefresh(selectedAtom);
@@ -33,6 +35,8 @@ export function useEnvironmentQuery<A, E>(
     data: Option.getOrNull(AsyncResult.value(result)),
     dataUpdatedAt: result._tag === "Success" ? result.timestamp : null,
     error: result._tag === "Failure" ? formatEnvironmentQueryError(result.cause) : null,
+    failure:
+      result._tag === "Failure" ? Option.getOrNull(Cause.findErrorOption(result.cause)) : null,
     isPending: atom !== null && result.waiting,
     isSuccess: result._tag === "Success",
     refresh,
