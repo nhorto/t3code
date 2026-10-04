@@ -328,42 +328,114 @@ export interface BacklogCreateTarget {
   readonly input: Pick<BacklogCreateIssueInput, "backlogId" | "projectId">;
 }
 
+/** How far one environment's board has got, for deciding where a new issue may go. */
+export interface BacklogEnvironmentAvailability {
+  readonly environmentId: EnvironmentId;
+  readonly label: string;
+  /** ready: connected and its snapshot arrived. */
+  readonly state: "ready" | "loading" | "offline" | "failed";
+}
+
+export type BacklogCreateResolution =
+  | { readonly target: BacklogCreateTarget; readonly blockedReason: null; readonly loading: false }
+  | { readonly target: null; readonly blockedReason: string; readonly loading: boolean };
+
+function blocked(blockedReason: string, loading = false): BacklogCreateResolution {
+  return { target: null, blockedReason, loading };
+}
+
+function joinLabels(environments: ReadonlyArray<BacklogEnvironmentAvailability>): string {
+  return [...new Set(environments.map((environment) => environment.label))].join(", ");
+}
+
 /**
- * Where a new issue lands. The Inbox (and "All") goes to the first connected
- * environment that already hosts an Inbox, else the first connected one. A
- * project goes to the environment hosting its backlog, else to a connected
- * checkout of the project, which creates the backlog on first use.
+ * Where a new issue lands, in the order the environments are listed. The Inbox
+ * (and "All") goes to an environment that already hosts an Inbox, else the first
+ * ready one. A project goes to the environment hosting its backlog. Without one,
+ * the server creates it from a project id, which is only safe once every
+ * environment with a checkout has sent its board: one still loading, or offline,
+ * may hold the backlog already, and creating here would split the project.
  */
 export function resolveBacklogCreateTarget(
   scope: BacklogScope,
-  connectedEnvironmentIds: ReadonlyArray<EnvironmentId>,
-): BacklogCreateTarget | null {
-  const connectedOrder = (environmentId: EnvironmentId) =>
-    connectedEnvironmentIds.indexOf(environmentId);
-  const connectedBacklogs = scope.backlogs
-    .filter((entry) => connectedOrder(entry.environmentId) !== -1)
+  environments: ReadonlyArray<BacklogEnvironmentAvailability>,
+): BacklogCreateResolution {
+  const ready = environments.filter((environment) => environment.state === "ready");
+  const order = (environmentId: EnvironmentId) =>
+    ready.findIndex((environment) => environment.environmentId === environmentId);
+  const hosted = scope.backlogs
+    .filter((entry) => order(entry.environmentId) !== -1)
     .filter((entry) => (scope.kind === "project" ? true : entry.backlog.kind === "inbox"))
-    .slice()
-    .sort(
-      (left, right) => connectedOrder(left.environmentId) - connectedOrder(right.environmentId),
-    );
-  const hosted = connectedBacklogs[0];
+    .sort((left, right) => order(left.environmentId) - order(right.environmentId))[0];
   if (hosted) {
-    return { environmentId: hosted.environmentId, input: { backlogId: hosted.backlog.id } };
+    return {
+      target: { environmentId: hosted.environmentId, input: { backlogId: hosted.backlog.id } },
+      blockedReason: null,
+      loading: false,
+    };
   }
   if (scope.kind !== "project") {
-    const environmentId = connectedEnvironmentIds[0];
-    return environmentId === undefined ? null : { environmentId, input: {} };
+    const first = ready[0];
+    if (first) {
+      return {
+        target: { environmentId: first.environmentId, input: {} },
+        blockedReason: null,
+        loading: false,
+      };
+    }
+    const loading = environments.filter((environment) => environment.state === "loading");
+    return loading.length > 0
+      ? blocked(`Loading ${joinLabels(loading)}…`, true)
+      : blocked("Connect an environment to add to the backlog.");
+  }
+  if (scope.backlogs.length > 0) {
+    return blocked(`The environment holding ${scope.label} is not connected.`);
+  }
+  // Environments this client does not follow (disabled, or without Backlog) cannot block.
+  const checkoutIds = new Set(scope.projectRefs.map((ref) => ref.environmentId));
+  const checkouts = environments.filter((environment) =>
+    checkoutIds.has(environment.environmentId),
+  );
+  const loading = checkouts.filter((environment) => environment.state === "loading");
+  if (loading.length > 0) return blocked(`Loading ${joinLabels(loading)}…`, true);
+  const failed = checkouts.find((environment) => environment.state === "failed");
+  if (failed) return blocked(`Could not read the backlog on ${failed.label}.`);
+  const offline = checkouts.filter((environment) => environment.state === "offline");
+  if (offline.length > 0) {
+    return blocked(
+      `${joinLabels(offline)} may hold this backlog and ${offline.length > 1 ? "are" : "is"} offline.`,
+    );
   }
   const checkout = scope.projectRefs
-    .filter((ref) => connectedOrder(ref.environmentId) !== -1)
-    .slice()
-    .sort(
-      (left, right) => connectedOrder(left.environmentId) - connectedOrder(right.environmentId),
-    )[0];
+    .filter((ref) => order(ref.environmentId) !== -1)
+    .sort((left, right) => order(left.environmentId) - order(right.environmentId))[0];
   return checkout
-    ? { environmentId: checkout.environmentId, input: { projectId: checkout.projectId } }
-    : null;
+    ? {
+        target: { environmentId: checkout.environmentId, input: { projectId: checkout.projectId } },
+        blockedReason: null,
+        loading: false,
+      }
+    : blocked(`No connected environment has ${scope.label}. Reconnect one to add here.`);
+}
+
+/**
+ * Projects on one environment that a move may target by project id, creating
+ * their backlog there: no backlog anywhere yet, and every checkout has answered.
+ */
+export function creatableProjectIdsOn(
+  scopes: ReadonlyArray<BacklogScope>,
+  environments: ReadonlyArray<BacklogEnvironmentAvailability>,
+  environmentId: EnvironmentId,
+): ReadonlySet<ProjectId> {
+  const ids = new Set<ProjectId>();
+  for (const scope of scopes) {
+    if (scope.kind !== "project" || scope.backlogs.length > 0) continue;
+    if (resolveBacklogCreateTarget(scope, environments).target === null) continue;
+    for (const ref of scope.projectRefs) {
+      if (ref.environmentId === environmentId) ids.add(ref.projectId);
+    }
+  }
+  return ids;
 }
 
 /** Quick-add starts on the board's project, or the Inbox when the board is not one project. */
@@ -381,12 +453,15 @@ export interface BacklogMoveTarget {
 /**
  * Where an issue can move: the Inbox, then every project on the issue's
  * environment, plus any backlog whose project is gone. A move stays on the
- * issue's environment, since backlogs elsewhere live in other databases.
+ * issue's environment, since backlogs elsewhere live in other databases. A
+ * project without a backlog here is offered only when `creatableProjectIds`
+ * allows it, so a move never creates a second backlog beside one elsewhere.
  */
 export function backlogMoveTargets(
   board: BacklogBoardState,
   issue: Pick<BacklogIssue, "backlogId">,
   projects: ReadonlyArray<{ readonly id: ProjectId; readonly title: string }>,
+  creatableProjectIds: ReadonlySet<ProjectId>,
 ): ReadonlyArray<BacklogMoveTarget> {
   const byLabel = (left: BacklogMoveTarget, right: BacklogMoveTarget) =>
     left.label.localeCompare(right.label, undefined, { sensitivity: "base" });
@@ -404,11 +479,12 @@ export function backlogMoveTargets(
     patch: { backlogId: backlog.id },
   });
   const inbox = board.backlogs.filter((backlog) => backlog.kind === "inbox").map(backlogTarget);
-  const projectTargets = projects.map((project): BacklogMoveTarget => {
+  const projectTargets = projects.flatMap((project): BacklogMoveTarget[] => {
     const backlog = backlogByProjectId.get(project.id);
-    return backlog
-      ? { ...backlogTarget(backlog), label: project.title }
-      : { key: `project:${project.id}`, label: project.title, patch: { projectId: project.id } };
+    if (backlog) return [{ ...backlogTarget(backlog), label: project.title }];
+    return creatableProjectIds.has(project.id)
+      ? [{ key: `project:${project.id}`, label: project.title, patch: { projectId: project.id } }]
+      : [];
   });
   const orphans = board.backlogs
     .filter(

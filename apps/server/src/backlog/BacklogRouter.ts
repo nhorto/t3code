@@ -1,0 +1,557 @@
+/**
+ * Routes an agent's backlog calls to the environment that owns the backlog:
+ * this one, or the hub it is linked to. Refs (WINE-12, WINE, ids) resolve here
+ * first and on the hub second. New project backlogs and Inbox ideas go to the
+ * hub when linked, since it is the fleet's default host; a project's existing
+ * backlog here stays here. Everything one call touches must live on one home.
+ *
+ * Clients do not route: they connect to every environment directly.
+ */
+import {
+  BacklogError,
+  type Backlog,
+  type BacklogActivity,
+  type BacklogActor,
+  type BacklogChildInput,
+  type BacklogClaimResult,
+  type BacklogId,
+  type BacklogIssue,
+  type BacklogIssueDetail,
+  type BacklogIssuePriority,
+  type BacklogIssueStatus,
+  type BacklogIssueType,
+  type BacklogListIssuesInput,
+  type BacklogReleaseStatus,
+  type BacklogRepositoryTarget,
+  type ProjectId,
+} from "@t3tools/contracts";
+import * as Context from "effect/Context";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+
+import * as ProjectService from "../project/ProjectService.ts";
+import { localBacklogHome, type BacklogHome } from "./BacklogHome.ts";
+import * as BacklogHubClient from "./BacklogHubClient.ts";
+import * as BacklogService from "./BacklogService.ts";
+
+/** Where a backlog or issue lives, from this environment's point of view. */
+export type BacklogHost = "local" | "hub";
+
+/** How the hub answered a merged listing; null when this machine has no hub. */
+export interface BacklogHubNote {
+  readonly label: string;
+  readonly state: "connected" | "unavailable";
+  readonly message: string | null;
+}
+
+export interface RoutedCreateIssueInput {
+  readonly backlog?: string | undefined;
+  readonly projectId?: ProjectId | undefined;
+  readonly parent?: string | undefined;
+  readonly blockedBy?: ReadonlyArray<string> | undefined;
+  readonly title: string;
+  readonly body?: string | undefined;
+  readonly type?: BacklogIssueType | undefined;
+  readonly status?: BacklogIssueStatus | undefined;
+  readonly priority?: BacklogIssuePriority | null | undefined;
+}
+
+export interface RoutedUpdateIssueInput {
+  readonly issue: string;
+  readonly backlog?: string | undefined;
+  readonly projectId?: ProjectId | undefined;
+  readonly parent?: string | null | undefined;
+  readonly blockedBy?: ReadonlyArray<string> | undefined;
+  readonly title?: string | undefined;
+  readonly body?: string | undefined;
+  readonly type?: BacklogIssueType | undefined;
+  readonly status?: BacklogIssueStatus | undefined;
+  readonly priority?: BacklogIssuePriority | null | undefined;
+}
+
+export interface RoutedListIssuesInput {
+  readonly backlog?: string | undefined;
+  readonly projectId?: ProjectId | undefined;
+  readonly parent?: string | undefined;
+  readonly status?: ReadonlyArray<BacklogIssueStatus> | undefined;
+  readonly type?: BacklogIssueType | undefined;
+  readonly frontierOnly?: boolean | undefined;
+}
+
+export interface RoutedClaimNextInput {
+  readonly backlog?: string | undefined;
+  readonly projectId?: ProjectId | undefined;
+  readonly parent?: string | undefined;
+  readonly type?: BacklogIssueType | undefined;
+}
+
+export type RoutedChildInput = Omit<BacklogChildInput, "blockedBy"> & {
+  readonly blockedBy?: ReadonlyArray<string> | undefined;
+};
+
+export class BacklogRouter extends Context.Service<
+  BacklogRouter,
+  {
+    readonly listBacklogs: () => Effect.Effect<
+      {
+        readonly backlogs: ReadonlyArray<Backlog & { readonly host: BacklogHost }>;
+        readonly hub: BacklogHubNote | null;
+      },
+      BacklogError
+    >;
+    readonly listIssues: (input: RoutedListIssuesInput) => Effect.Effect<
+      {
+        readonly issues: ReadonlyArray<BacklogIssue & { readonly host: BacklogHost }>;
+        readonly hub: BacklogHubNote | null;
+      },
+      BacklogError
+    >;
+    readonly getIssue: (ref: string) => Effect.Effect<BacklogIssueDetail, BacklogError>;
+    readonly createIssue: (
+      input: RoutedCreateIssueInput,
+      actor: BacklogActor,
+    ) => Effect.Effect<BacklogIssue, BacklogError>;
+    readonly createChildren: (
+      input: { readonly parent: string; readonly children: ReadonlyArray<RoutedChildInput> },
+      actor: BacklogActor,
+    ) => Effect.Effect<ReadonlyArray<BacklogIssue>, BacklogError>;
+    readonly updateIssue: (
+      input: RoutedUpdateIssueInput,
+      actor: BacklogActor,
+    ) => Effect.Effect<BacklogIssue, BacklogError>;
+    readonly claim: (
+      ref: string,
+      actor: BacklogActor,
+    ) => Effect.Effect<BacklogClaimResult, BacklogError>;
+    readonly claimNext: (
+      input: RoutedClaimNextInput,
+      actor: BacklogActor,
+    ) => Effect.Effect<BacklogClaimResult | null, BacklogError>;
+    readonly release: (
+      input: {
+        readonly issue: string;
+        readonly status: BacklogReleaseStatus;
+        readonly note?: string | undefined;
+      },
+      actor: BacklogActor,
+    ) => Effect.Effect<BacklogIssue, BacklogError>;
+    readonly comment: (
+      input: { readonly issue: string; readonly text: string },
+      actor: BacklogActor,
+    ) => Effect.Effect<BacklogActivity, BacklogError>;
+    /** With an issue, links it; without, every issue the actor's thread holds here and on the hub. */
+    readonly linkPullRequest: (
+      input: { readonly url: string; readonly issue?: string | undefined },
+      actor: BacklogActor,
+    ) => Effect.Effect<ReadonlyArray<BacklogIssue>, BacklogError>;
+  }
+>()("t3/backlog/BacklogRouter") {}
+
+interface Target {
+  readonly host: BacklogHost;
+  readonly home: BacklogHome;
+  readonly label: string;
+}
+
+/** Where a project's issues go: an existing backlog, or one to create on first use. */
+type ProjectPlacement =
+  | { readonly target: Target; readonly backlogId: BacklogId }
+  | { readonly target: Target; readonly repository: BacklogRepositoryTarget }
+  | { readonly target: Target; readonly projectId: ProjectId };
+
+const isNotFound = (error: BacklogError) => error.code === "not_found";
+const notFound = (message: string) => new BacklogError({ code: "not_found", message });
+const invalid = (message: string) => new BacklogError({ code: "invalid", message });
+
+const withHost =
+  (host: BacklogHost) =>
+  <A extends object>(rows: ReadonlyArray<A>): ReadonlyArray<A & { readonly host: BacklogHost }> =>
+    rows.map((row) => ({ ...row, host }));
+
+const backlogMatches = (backlog: Backlog, ref: string) =>
+  backlog.id === ref.trim() || backlog.key === ref.trim().toUpperCase();
+
+const placementInput = (placement: ProjectPlacement) =>
+  "backlogId" in placement
+    ? { backlogId: placement.backlogId }
+    : "repository" in placement
+      ? { repository: placement.repository }
+      : { projectId: placement.projectId };
+
+const crossMachine = () =>
+  invalid(
+    "That would move an issue between machines, which is not supported yet. Create it on the other backlog instead.",
+  );
+
+export const make = Effect.gen(function* () {
+  const service = yield* BacklogService.BacklogService;
+  const hubClient = yield* BacklogHubClient.BacklogHubClient;
+  const projects = yield* ProjectService.ProjectService;
+
+  const local: Target = { host: "local", home: localBacklogHome(service), label: "this machine" };
+  const hub = hubClient.linkedHub.pipe(
+    Effect.map(
+      Option.map((linked): Target => ({ host: "hub", home: hubClient.home, label: linked.label })),
+    ),
+  );
+  /** Where new backlogs and Inbox ideas go: the hub when linked. */
+  const defaultTarget = hub.pipe(Effect.map(Option.getOrElse(() => local)));
+
+  /** Local first, then the hub. */
+  const resolveIssue = (ref: string) =>
+    local.home.resolveIssue(ref).pipe(
+      Effect.map((id) => ({ target: local, id })),
+      Effect.catchIf(isNotFound, (localMiss) =>
+        Effect.gen(function* () {
+          const linked = yield* hub;
+          if (Option.isNone(linked)) return yield* localMiss;
+          const target = linked.value;
+          const id = yield* target.home.resolveIssue(ref).pipe(
+            Effect.mapError(
+              (error) =>
+                new BacklogError({
+                  ...error,
+                  message: `${ref} is not on this machine. On ${target.label}: ${error.message}`,
+                }),
+            ),
+          );
+          return { target, id };
+        }),
+      ),
+    );
+
+  const resolveIssueIn = (target: Target, refs: ReadonlyArray<string>) =>
+    Effect.forEach(refs, (ref) =>
+      target.home.resolveIssue(ref).pipe(
+        Effect.mapError((error) =>
+          error.code === "not_found" && target.host === "local"
+            ? new BacklogError({
+                ...error,
+                message: `${error.message} Related issues must be on the same machine as the issue.`,
+              })
+            : error,
+        ),
+      ),
+    );
+
+  const resolveBacklog = (ref: string) =>
+    service.resolveBacklogRef(ref).pipe(
+      Effect.map((backlog) => ({ target: local, backlogId: backlog.id })),
+      Effect.catchIf(isNotFound, (localMiss) =>
+        Effect.gen(function* () {
+          const linked = yield* hub;
+          if (Option.isNone(linked)) return yield* localMiss;
+          const found = (yield* linked.value.home.listBacklogs()).find((backlog) =>
+            backlogMatches(backlog, ref),
+          );
+          if (found === undefined) {
+            return yield* notFound(
+              `Backlog ${ref} is not on this machine or on ${linked.value.label}.`,
+            );
+          }
+          return { target: linked.value, backlogId: found.id };
+        }),
+      ),
+    );
+
+  /**
+   * A project's backlog here wins. Otherwise, with a hub, the project's
+   * repository names the backlog there, since project ids are local. With
+   * `find`, nothing is created: a project without a backlog yields none.
+   */
+  const placeProject = (projectId: ProjectId, mode: "create" | "find") =>
+    Effect.gen(function* () {
+      const shell = yield* projects.getShell(projectId).pipe(Effect.orDie);
+      if (Option.isNone(shell)) return yield* notFound("Project not found.");
+      const repositoryKey = shell.value.repositoryIdentity?.canonicalKey ?? null;
+      const own = (yield* service.listBacklogs()).find(
+        (backlog) =>
+          backlog.projectId === projectId ||
+          (repositoryKey !== null && backlog.repositoryKey === repositoryKey),
+      );
+      if (own !== undefined)
+        return Option.some<ProjectPlacement>({ target: local, backlogId: own.id });
+      const linked = yield* hub;
+      if (Option.isSome(linked) && repositoryKey !== null) {
+        const target = linked.value;
+        if (mode === "create") {
+          return Option.some<ProjectPlacement>({
+            target,
+            repository: { key: repositoryKey, title: shell.value.title },
+          });
+        }
+        const onHub = (yield* target.home.listBacklogs()).find(
+          (backlog) => backlog.repositoryKey === repositoryKey,
+        );
+        return onHub === undefined
+          ? Option.none<ProjectPlacement>()
+          : Option.some<ProjectPlacement>({ target, backlogId: onHub.id });
+      }
+      return mode === "create"
+        ? Option.some<ProjectPlacement>({ target: local, projectId })
+        : Option.none<ProjectPlacement>();
+    });
+
+  const placeProjectForCreate = (projectId: ProjectId) =>
+    placeProject(projectId, "create").pipe(
+      Effect.flatMap(
+        Option.match({
+          onNone: () => Effect.fail(notFound("Project not found.")),
+          onSome: Effect.succeed,
+        }),
+      ),
+    );
+
+  /** The hub's answer for a merged listing, or how it failed. */
+  const listOnHub = <A>(list: (target: Target) => Effect.Effect<ReadonlyArray<A>, BacklogError>) =>
+    Effect.gen(function* () {
+      const linked = yield* hub;
+      if (Option.isNone(linked)) return { rows: [] as ReadonlyArray<A>, note: null };
+      const target = linked.value;
+      const result = yield* Effect.result(list(target));
+      if (result._tag === "Failure") {
+        if (result.failure.code !== "unavailable") return yield* result.failure;
+        return {
+          rows: [] as ReadonlyArray<A>,
+          note: { label: target.label, state: "unavailable", message: result.failure.message },
+        } satisfies { rows: ReadonlyArray<A>; note: BacklogHubNote };
+      }
+      return {
+        rows: result.success,
+        note: { label: target.label, state: "connected", message: null },
+      } satisfies { rows: ReadonlyArray<A>; note: BacklogHubNote };
+    });
+
+  const noteFor = (target: Target): BacklogHubNote | null =>
+    target.host === "hub" ? { label: target.label, state: "connected", message: null } : null;
+
+  const listBacklogs: BacklogRouter["Service"]["listBacklogs"] = () =>
+    Effect.gen(function* () {
+      const own = yield* service.listBacklogs();
+      const remote = yield* listOnHub((target) => target.home.listBacklogs());
+      return {
+        backlogs: [...withHost("local")(own), ...withHost("hub")(remote.rows)],
+        hub: remote.note,
+      };
+    });
+
+  const listIssues: BacklogRouter["Service"]["listIssues"] = (input) =>
+    Effect.gen(function* () {
+      const filters: BacklogListIssuesInput = {
+        status: input.status,
+        type: input.type,
+        frontierOnly: input.frontierOnly,
+      };
+      const scoped = (target: Target, backlogId: BacklogId | undefined) =>
+        Effect.gen(function* () {
+          const parentId =
+            input.parent === undefined
+              ? undefined
+              : (yield* resolveIssueIn(target, [input.parent]))[0];
+          const issues = yield* target.home.listIssues({ ...filters, backlogId, parentId });
+          return { issues: withHost(target.host)(issues), hub: noteFor(target) };
+        });
+      if (input.backlog !== undefined) {
+        const { target, backlogId } = yield* resolveBacklog(input.backlog);
+        return yield* scoped(target, backlogId);
+      }
+      if (input.projectId !== undefined) {
+        const placement = yield* placeProject(input.projectId, "find");
+        if (Option.isNone(placement) || !("backlogId" in placement.value)) {
+          return { issues: [], hub: null };
+        }
+        return yield* scoped(placement.value.target, placement.value.backlogId);
+      }
+      if (input.parent !== undefined) {
+        const { target } = yield* resolveIssue(input.parent);
+        return yield* scoped(target, undefined);
+      }
+      const own = yield* local.home.listIssues(filters);
+      const remote = yield* listOnHub((target) => target.home.listIssues(filters));
+      return {
+        issues: [...withHost("local")(own), ...withHost("hub")(remote.rows)],
+        hub: remote.note,
+      };
+    });
+
+  const getIssue: BacklogRouter["Service"]["getIssue"] = (ref) =>
+    resolveIssue(ref).pipe(
+      Effect.flatMap(({ target, id }) => target.home.getIssue({ issueId: id })),
+    );
+
+  const createIssue: BacklogRouter["Service"]["createIssue"] = (
+    { backlog, projectId, parent, blockedBy, ...fields },
+    actor,
+  ) =>
+    Effect.gen(function* () {
+      const placed =
+        backlog !== undefined
+          ? yield* resolveBacklog(backlog).pipe(
+              Effect.map(({ target, backlogId }) => ({ target, where: { backlogId } })),
+            )
+          : projectId !== undefined
+            ? yield* placeProjectForCreate(projectId).pipe(
+                Effect.map((placement) => ({
+                  target: placement.target,
+                  where: placementInput(placement),
+                })),
+              )
+            : parent !== undefined
+              ? // A child with no other target joins its parent's backlog.
+                yield* resolveIssue(parent).pipe(
+                  Effect.flatMap(({ target, id }) =>
+                    target.home.getIssue({ issueId: id }).pipe(
+                      Effect.map((detail) => ({
+                        target,
+                        where: { backlogId: detail.issue.backlogId },
+                      })),
+                    ),
+                  ),
+                )
+              : { target: yield* defaultTarget, where: {} };
+      const { target, where } = placed;
+      return yield* target.home.createIssue(
+        {
+          ...fields,
+          ...where,
+          ...(parent === undefined
+            ? {}
+            : { parentId: (yield* resolveIssueIn(target, [parent]))[0]! }),
+          ...(blockedBy === undefined
+            ? {}
+            : { blockedBy: yield* resolveIssueIn(target, blockedBy) }),
+        },
+        actor,
+      );
+    });
+
+  const createChildren: BacklogRouter["Service"]["createChildren"] = (input, actor) =>
+    Effect.gen(function* () {
+      const { target, id } = yield* resolveIssue(input.parent);
+      const children = yield* Effect.forEach(input.children, ({ blockedBy, ...child }) =>
+        blockedBy === undefined
+          ? Effect.succeed(child)
+          : resolveIssueIn(target, blockedBy).pipe(
+              Effect.map((ids) => ({ ...child, blockedBy: ids })),
+            ),
+      );
+      return yield* target.home.createChildren({ parentId: id, children }, actor);
+    });
+
+  const updateIssue: BacklogRouter["Service"]["updateIssue"] = (
+    { issue, backlog, projectId, parent, blockedBy, ...fields },
+    actor,
+  ) =>
+    Effect.gen(function* () {
+      const { target, id } = yield* resolveIssue(issue);
+      let move: Record<string, unknown> = {};
+      if (backlog !== undefined) {
+        const destination = yield* resolveBacklog(backlog);
+        if (destination.target.host !== target.host) return yield* crossMachine();
+        move = { backlogId: destination.backlogId };
+      } else if (projectId !== undefined) {
+        const placement = yield* placeProjectForCreate(projectId);
+        if (placement.target.host !== target.host) return yield* crossMachine();
+        move = placementInput(placement);
+      }
+      return yield* target.home.updateIssue(
+        {
+          ...fields,
+          ...move,
+          issueId: id,
+          ...(parent === undefined
+            ? {}
+            : {
+                parentId: parent === null ? null : (yield* resolveIssueIn(target, [parent]))[0]!,
+              }),
+          ...(blockedBy === undefined
+            ? {}
+            : { blockedBy: yield* resolveIssueIn(target, blockedBy) }),
+        },
+        actor,
+      );
+    });
+
+  const claim: BacklogRouter["Service"]["claim"] = (ref, actor) =>
+    resolveIssue(ref).pipe(
+      Effect.flatMap(({ target, id }) => target.home.claim({ issueId: id }, actor)),
+    );
+
+  const claimNext: BacklogRouter["Service"]["claimNext"] = (input, actor) =>
+    Effect.gen(function* () {
+      const claimIn = (target: Target, backlogId: BacklogId | undefined) =>
+        Effect.gen(function* () {
+          const parentId =
+            input.parent === undefined
+              ? undefined
+              : (yield* resolveIssueIn(target, [input.parent]))[0];
+          return yield* target.home.claimNext({ backlogId, parentId, type: input.type }, actor);
+        });
+      if (input.backlog !== undefined) {
+        const { target, backlogId } = yield* resolveBacklog(input.backlog);
+        return yield* claimIn(target, backlogId);
+      }
+      if (input.projectId !== undefined) {
+        const placement = yield* placeProject(input.projectId, "find");
+        if (Option.isNone(placement) || !("backlogId" in placement.value)) return null;
+        return yield* claimIn(placement.value.target, placement.value.backlogId);
+      }
+      if (input.parent !== undefined) {
+        return yield* claimIn((yield* resolveIssue(input.parent)).target, undefined);
+      }
+      const here = yield* claimIn(local, undefined);
+      if (here !== null) return here;
+      const linked = yield* hub;
+      return Option.isNone(linked) ? null : yield* claimIn(linked.value, undefined);
+    });
+
+  const release: BacklogRouter["Service"]["release"] = ({ issue, status, note }, actor) =>
+    resolveIssue(issue).pipe(
+      Effect.flatMap(({ target, id }) =>
+        target.home.release(
+          { issueId: id, status, ...(note === undefined ? {} : { note }) },
+          actor,
+        ),
+      ),
+    );
+
+  const comment: BacklogRouter["Service"]["comment"] = ({ issue, text }, actor) =>
+    resolveIssue(issue).pipe(
+      Effect.flatMap(({ target, id }) => target.home.comment({ issueId: id, text }, actor)),
+    );
+
+  const linkPullRequest: BacklogRouter["Service"]["linkPullRequest"] = ({ url, issue }, actor) =>
+    issue !== undefined
+      ? resolveIssue(issue).pipe(
+          Effect.flatMap(({ target, id }) =>
+            target.home.linkPullRequest({ url, issueId: id }, actor),
+          ),
+        )
+      : Effect.gen(function* () {
+          const own = yield* local.home.linkPullRequest({ url }, actor);
+          const remote = yield* listOnHub((target) => target.home.linkPullRequest({ url }, actor));
+          return [...own, ...remote.rows];
+        });
+
+  return BacklogRouter.of({
+    listBacklogs,
+    listIssues,
+    getIssue,
+    createIssue,
+    createChildren,
+    updateIssue,
+    claim,
+    claimNext,
+    release,
+    comment,
+    linkPullRequest,
+  });
+});
+
+export const layer = Layer.effect(BacklogRouter, make);
+
+/** The router with the hub link and its lease renewal, for the server runtime. */
+export const fleetLayer = Layer.mergeAll(layer, BacklogHubClient.renewalLayer).pipe(
+  Layer.provideMerge(BacklogHubClient.layer),
+);

@@ -387,6 +387,29 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
     }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
   );
 
+  it.effect("redeems a standard pairing link as a year-long, backlog-only hub link", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const pairingCredential = yield* serverAuth.issuePairingCredential();
+
+      const link = yield* serverAuth.exchangeBootstrapCredentialForAccessToken(
+        pairingCredential.credential,
+        ["backlog:read", "backlog:write"],
+        requestMetadata,
+      );
+      expect(link.scope).toBe("backlog:read backlog:write");
+      expect(link.expires_in).toBeGreaterThan(300 * 24 * 60 * 60);
+
+      const standard = yield* serverAuth.issuePairingCredential();
+      const client = yield* serverAuth.exchangeBootstrapCredentialForAccessToken(
+        standard.credential,
+        undefined,
+        requestMetadata,
+      );
+      expect(client.expires_in).toBeLessThanOrEqual(30 * 24 * 60 * 60);
+    }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
+  );
+
   it.effect("rotates desktop bearer sessions without accumulating authorized clients", () =>
     Effect.gen(function* () {
       const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;

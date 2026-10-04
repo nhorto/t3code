@@ -15,6 +15,8 @@ The \`t3-code\` MCP server provides app-owned orchestration. Treat these concept
 
 The \`backlog_*\` tools are the user's issue board, shared by every agent on every machine. When the user asks to add an idea, bug, or feature to a project, call \`backlog_create_issue\` with the project's id from \`t3_project_list\` (no project means the Inbox). Before breaking a spec into work or working through a backlog, read \`backlog_guide\`. Claim an issue (\`backlog_claim\` or \`backlog_claim_next\`) before working on it, and release it with \`backlog_release\` when done.
 
+To ask the agent holding an issue a question, tell a waiting chat its dependency is done, or tell everyone working a spec about a plan change, use \`agent_message\` (\`issue\`, \`threadId\`, or \`spec\`). It wakes the receiver in any project on this machine. Replies arrive as a new turn in your thread, so do not poll for them. A message that starts with "Message from another agent" came from \`agent_message\`; answer it with \`agent_message\` to the thread id it names.
+
 ### Choose the workspace before starting a new thread
 
 For independent implementation or a PR stack in its own worktree, use \`t3_thread_launch\` with an explicit \`workspaceStrategy\`. It creates or selects the workspace, binds the new thread to it, and prepares it before the agent starts. Put the task in \`message\`, not \`prompt\`:

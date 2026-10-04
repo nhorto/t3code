@@ -119,6 +119,8 @@ export interface BacklogSwitcherEntry {
   readonly openCount: number;
   /** Null while no environment that could take a new issue is reachable. */
   readonly createTarget: BacklogCreateTarget | null;
+  /** Why there is no create target, in words for the add field. Null when there is one. */
+  readonly createBlockedReason: string | null;
   /** The logical project's member checkouts, so a project page can link straight here. */
   readonly projectRefs: ReadonlyArray<{
     readonly environmentId: EnvironmentId;
@@ -139,16 +141,83 @@ function preferPrimary<T extends { readonly environmentId: EnvironmentId }>(
   );
 }
 
-function countOpen(sources: ReadonlyArray<BacklogSource>, backlogs: ReadonlyArray<BacklogRef>) {
-  let count = 0;
-  for (const ref of backlogs) {
-    const board = sources.find((source) => source.environmentId === ref.environmentId)?.board;
-    if (!board) continue;
-    for (const issue of board.issues) {
-      if (issue.backlogId === ref.backlog.id && !isBacklogStatusClosed(issue.status)) count += 1;
-    }
+type CreateResolution = Pick<BacklogSwitcherEntry, "createTarget" | "createBlockedReason">;
+
+function joinLabels(labels: ReadonlyArray<string>): string {
+  return [...new Set(labels)].join(", ");
+}
+
+/**
+ * Where a project's next issue goes. An existing backlog wins. Without one, the server creates
+ * it from a project id, which is only safe once every machine with a checkout has shown its
+ * board: a machine still loading, or offline, may hold the backlog already, and creating here
+ * would split the project across two boards.
+ */
+function resolveProjectCreate(input: {
+  readonly backlogs: ReadonlyArray<BacklogRef>;
+  readonly projectRefs: ReadonlyArray<{
+    readonly environmentId: EnvironmentId;
+    readonly projectId: ProjectId;
+  }>;
+  readonly sourceById: ReadonlyMap<EnvironmentId, BacklogSource>;
+  readonly primaryEnvironmentId: EnvironmentId | null;
+}): CreateResolution {
+  const { sourceById, primaryEnvironmentId } = input;
+  const writable = (environmentId: EnvironmentId) => {
+    const source = sourceById.get(environmentId);
+    return source !== undefined && isBacklogSourceWritable(source);
+  };
+  const label = (environmentId: EnvironmentId) =>
+    sourceById.get(environmentId)?.label ?? "Unknown machine";
+  const existing = preferPrimary(input.backlogs, writable, primaryEnvironmentId);
+  if (existing) {
+    return {
+      createTarget: { environmentId: existing.environmentId, backlogId: existing.backlog.id },
+      createBlockedReason: null,
+    };
   }
-  return count;
+  if (input.backlogs.length > 0) {
+    const holders = input.backlogs.map((ref) => label(ref.environmentId));
+    return {
+      createTarget: null,
+      createBlockedReason: `${joinLabels(holders)} ${holders.length > 1 ? "hold" : "holds"} this backlog and ${holders.length > 1 ? "are" : "is"} offline.`,
+    };
+  }
+  // A machine this client does not subscribe to (disabled, or without Backlog) cannot block.
+  const checkouts = [...new Set(input.projectRefs.map((ref) => ref.environmentId))].flatMap(
+    (environmentId) => {
+      const source = sourceById.get(environmentId);
+      return source ? [source] : [];
+    },
+  );
+  const loading = checkouts.filter((source) => source.status === "loading");
+  if (loading.length > 0) {
+    return {
+      createTarget: null,
+      createBlockedReason: `Loading ${joinLabels(loading.map((source) => source.label))}…`,
+    };
+  }
+  const failed = checkouts.find((source) => source.status === "error");
+  if (failed) {
+    return {
+      createTarget: null,
+      createBlockedReason: `Could not read the backlog on ${failed.label}.`,
+    };
+  }
+  const offline = checkouts.filter((source) => source.status !== "live");
+  if (offline.length > 0) {
+    return {
+      createTarget: null,
+      createBlockedReason: `${joinLabels(offline.map((source) => source.label))} may hold this backlog and ${offline.length > 1 ? "are" : "is"} offline.`,
+    };
+  }
+  const own = preferPrimary(input.projectRefs, writable, primaryEnvironmentId);
+  return own
+    ? {
+        createTarget: { environmentId: own.environmentId, projectId: own.projectId },
+        createBlockedReason: null,
+      }
+    : { createTarget: null, createBlockedReason: "No machine with this project is connected." };
 }
 
 /**
@@ -156,18 +225,75 @@ function countOpen(sources: ReadonlyArray<BacklogSource>, backlogs: ReadonlyArra
  * logical project (the same repository on several machines is one project), then any backlog
  * whose project this client cannot see.
  */
-export function buildBacklogSwitcher(input: {
+export function buildBacklogSwitcher(
+  input: BacklogSwitcherInput,
+): ReadonlyArray<BacklogSwitcherEntry> {
+  return withBacklogOpenCounts(buildBacklogSwitcherEntries(input), input.sources);
+}
+
+export interface BacklogSwitcherInput {
   readonly sources: ReadonlyArray<BacklogSource>;
   readonly projects: ReadonlyArray<Project>;
   readonly groupingSettings: ProjectGroupingSettings;
   readonly primaryEnvironmentId: EnvironmentId | null;
-}): ReadonlyArray<BacklogSwitcherEntry> {
+}
+
+/**
+ * Whether two source lists build the same switcher, open counts aside. Issue deltas keep each
+ * board's `backlogs` array, so this holds for them and the grouping need not be rebuilt.
+ */
+export function sameBacklogSwitcherSources(
+  previous: ReadonlyArray<BacklogSource>,
+  next: ReadonlyArray<BacklogSource>,
+): boolean {
+  return (
+    previous.length === next.length &&
+    previous.every((source, index) => {
+      const other = next[index]!;
+      return (
+        source.environmentId === other.environmentId &&
+        source.label === other.label &&
+        source.status === other.status &&
+        (source.board === null) === (other.board === null) &&
+        source.board?.backlogs === other.board?.backlogs
+      );
+    })
+  );
+}
+
+/** Open issues per entry, one pass over every board. Entries whose count holds keep identity. */
+export function withBacklogOpenCounts(
+  entries: ReadonlyArray<BacklogSwitcherEntry>,
+  sources: ReadonlyArray<BacklogSource>,
+): ReadonlyArray<BacklogSwitcherEntry> {
+  const openByBacklog = new Map<string, number>();
+  for (const source of sources) {
+    for (const issue of source.board?.issues ?? []) {
+      if (isBacklogStatusClosed(issue.status)) continue;
+      const key = `${source.environmentId}:${issue.backlogId}`;
+      openByBacklog.set(key, (openByBacklog.get(key) ?? 0) + 1);
+    }
+  }
+  return entries.map((entry) => {
+    let openCount = 0;
+    for (const ref of entry.backlogs) {
+      openCount += openByBacklog.get(`${ref.environmentId}:${ref.backlog.id}`) ?? 0;
+    }
+    return openCount === entry.openCount ? entry : { ...entry, openCount };
+  });
+}
+
+/** The switcher without open counts: depends on backlogs and connection state, not issues. */
+export function buildBacklogSwitcherEntries(
+  input: BacklogSwitcherInput,
+): ReadonlyArray<BacklogSwitcherEntry> {
   const { sources, primaryEnvironmentId } = input;
   const labelByEnvironment = new Map(sources.map((source) => [source.environmentId, source.label]));
-  const writable = (environmentId: EnvironmentId) =>
-    sources.some(
-      (source) => source.environmentId === environmentId && isBacklogSourceWritable(source),
-    );
+  const sourceById = new Map(sources.map((source) => [source.environmentId, source]));
+  const writable = (environmentId: EnvironmentId) => {
+    const source = sourceById.get(environmentId);
+    return source !== undefined && isBacklogSourceWritable(source);
+  };
 
   const allBacklogs: BacklogRef[] = sources.flatMap((source) =>
     (source.board?.backlogs ?? []).map((backlog) => ({
@@ -188,6 +314,13 @@ export function buildBacklogSwitcher(input: {
     : inboxSource
       ? { environmentId: inboxSource.environmentId }
       : null;
+  const loadingSources = sources.filter((source) => source.status === "loading");
+  const inboxBlockedReason =
+    inboxTarget !== null
+      ? null
+      : loadingSources.length > 0
+        ? `Loading ${joinLabels(loadingSources.map((source) => source.label))}…`
+        : "No connected machine can take a new issue.";
 
   const groups = buildProjectGroups({
     projects: input.projects,
@@ -240,10 +373,6 @@ export function buildBacklogSwitcher(input: {
 
   const projectEntries = groups.map((group): BacklogSwitcherEntry & { machines: string[] } => {
     const backlogs = backlogsByGroup.get(group.key) ?? [];
-    const existing = preferPrimary(backlogs, writable, primaryEnvironmentId);
-    const ownProject = existing
-      ? null
-      : preferPrimary(group.memberProjectRefs, writable, primaryEnvironmentId);
     const machines = [
       ...new Set(
         (backlogs.length > 0 ? backlogs : group.memberProjectRefs).map(
@@ -258,12 +387,13 @@ export function buildBacklogSwitcher(input: {
       machineLabel: null,
       machines,
       backlogs,
-      openCount: countOpen(sources, backlogs),
-      createTarget: existing
-        ? { environmentId: existing.environmentId, backlogId: existing.backlog.id }
-        : ownProject
-          ? { environmentId: ownProject.environmentId, projectId: ownProject.projectId }
-          : null,
+      openCount: 0,
+      ...resolveProjectCreate({
+        backlogs,
+        projectRefs: group.memberProjectRefs,
+        sourceById,
+        primaryEnvironmentId,
+      }),
       projectRefs: group.memberProjectRefs,
     };
   });
@@ -279,10 +409,8 @@ export function buildBacklogSwitcher(input: {
     machineLabel: null,
     machines: [labelByEnvironment.get(ref.environmentId) ?? "Unknown machine"],
     backlogs: [ref],
-    openCount: countOpen(sources, [ref]),
-    createTarget: writable(ref.environmentId)
-      ? { environmentId: ref.environmentId, backlogId: ref.backlog.id }
-      : null,
+    openCount: 0,
+    ...resolveProjectCreate({ backlogs: [ref], projectRefs: [], sourceById, primaryEnvironmentId }),
     projectRefs: [],
   }));
 
@@ -312,8 +440,9 @@ export function buildBacklogSwitcher(input: {
       label: "All backlogs",
       machineLabel: null,
       backlogs: allBacklogs,
-      openCount: countOpen(sources, allBacklogs),
+      openCount: 0,
       createTarget: inboxTarget,
+      createBlockedReason: inboxBlockedReason,
       projectRefs: [],
     },
     {
@@ -322,12 +451,32 @@ export function buildBacklogSwitcher(input: {
       label: "Inbox",
       machineLabel: null,
       backlogs: inboxes,
-      openCount: countOpen(sources, inboxes),
+      openCount: 0,
       createTarget: inboxTarget,
+      createBlockedReason: inboxBlockedReason,
       projectRefs: [],
     },
     ...disambiguated,
   ];
+}
+
+/**
+ * Projects on one machine that a move may target by project id, creating their backlog there:
+ * those with no backlog anywhere yet, and only once every machine with a checkout has answered.
+ */
+export function creatableProjectIdsOn(
+  entries: ReadonlyArray<BacklogSwitcherEntry>,
+  environmentId: EnvironmentId,
+): ReadonlySet<ProjectId> {
+  const ids = new Set<ProjectId>();
+  for (const entry of entries) {
+    if (entry.scope.kind !== "project" || entry.backlogs.length > 0) continue;
+    if (entry.createTarget?.projectId === undefined) continue;
+    for (const ref of entry.projectRefs) {
+      if (ref.environmentId === environmentId) ids.add(ref.projectId);
+    }
+  }
+  return ids;
 }
 
 /** The entry a project (thread, draft or project page) belongs to, else the Inbox. */
@@ -453,6 +602,30 @@ export function displayedBacklogStatus(
     : item.issue.status;
 }
 
+/**
+ * Drops moves the server has answered: its row moved on, or already shows the status. Returns the
+ * same map when nothing changed, so a state setter can skip the render.
+ */
+export function prunePendingBacklogMoves(
+  pendingMoves: ReadonlyMap<string, PendingBacklogMove>,
+  sources: ReadonlyArray<BacklogSource>,
+): ReadonlyMap<string, PendingBacklogMove> {
+  if (pendingMoves.size === 0) return pendingMoves;
+  let next: Map<string, PendingBacklogMove> | null = null;
+  for (const source of sources) {
+    if (!source.board) continue;
+    for (const issue of source.board.issues) {
+      const key = boardIssueKey(source.environmentId, issue.id);
+      const move = pendingMoves.get(key);
+      if (!move) continue;
+      if (issue.updatedAt === move.fromUpdatedAt && issue.status !== move.status) continue;
+      next ??= new Map(pendingMoves);
+      next.delete(key);
+    }
+  }
+  return next ?? pendingMoves;
+}
+
 function compareUpdatedDesc(left: BoardIssue, right: BoardIssue): number {
   if (left.issue.updatedAt !== right.issue.updatedAt) {
     return left.issue.updatedAt < right.issue.updatedAt ? 1 : -1;
@@ -505,6 +678,19 @@ export function buildBacklogColumns(input: {
     );
     return { status, issues };
   });
+}
+
+/** Closed columns grow forever, so they draw the newest few and page in the rest. */
+export const CLOSED_COLUMN_PAGE = { initial: 30, step: 50 } as const;
+
+export function pageBacklogColumn(
+  column: BacklogColumn,
+  limit: number,
+): { readonly visible: ReadonlyArray<BoardIssue>; readonly hidden: number } {
+  if (!isBacklogStatusClosed(column.status) || column.issues.length <= limit) {
+    return { visible: column.issues, hidden: 0 };
+  }
+  return { visible: column.issues.slice(0, limit), hidden: column.issues.length - limit };
 }
 
 /** Whether the visible issues come from more than one machine, so cards should name theirs. */
@@ -621,12 +807,14 @@ export interface BacklogMoveTarget {
 
 /**
  * Where an issue can move on its own machine: any other backlog there, or a project there that
- * has no backlog yet (the server creates it on the move). Inbox first, then by name.
+ * has no backlog yet (the server creates it on the move) when `creatableProjectIds` allows it.
+ * Inbox first, then by name.
  */
 export function backlogMoveTargets(input: {
   readonly currentBacklogId: BacklogId;
   readonly backlogs: ReadonlyArray<Backlog>;
   readonly projects: ReadonlyArray<Pick<Project, "id" | "title">>;
+  readonly creatableProjectIds: ReadonlySet<ProjectId>;
 }): ReadonlyArray<BacklogMoveTarget> {
   const projectsWithBacklog = new Set(input.backlogs.map((backlog) => backlog.projectId));
   const existing = input.backlogs
@@ -637,7 +825,10 @@ export function backlogMoveTargets(input: {
       input: { backlogId: backlog.id },
     }));
   const fresh = input.projects
-    .filter((project) => !projectsWithBacklog.has(project.id))
+    .filter(
+      (project) =>
+        !projectsWithBacklog.has(project.id) && input.creatableProjectIds.has(project.id),
+    )
     .map((project): BacklogMoveTarget => ({
       value: `project:${project.id}`,
       label: project.title,

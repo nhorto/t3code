@@ -13,6 +13,7 @@ import {
   backlogMoveTargets,
   buildBacklogListItems,
   buildBacklogScopes,
+  creatableProjectIdsOn,
   defaultQuickAddScopeKey,
   describeBacklogClaim,
   filterBacklogIssues,
@@ -22,6 +23,7 @@ import {
   resolveBacklogCreateTarget,
   resolveBacklogScope,
   selectBacklogScopeIssues,
+  type BacklogEnvironmentAvailability,
   type BacklogProjectGroup,
   type EnvironmentBacklogBoard,
 } from "./backlog.logic";
@@ -77,6 +79,13 @@ function issue(
     closedAt: null,
     ...overrides,
   } as BacklogIssue;
+}
+
+function env(
+  environmentId: EnvironmentId,
+  state: BacklogEnvironmentAvailability["state"] = "ready",
+): BacklogEnvironmentAvailability {
+  return { environmentId, label: environmentId === GEEKOM ? "Geekom" : "Laptop", state };
 }
 
 function board(backlogs: Backlog[], issues: BacklogIssue[]): BacklogBoardState {
@@ -296,35 +305,68 @@ describe("resolveBacklogCreateTarget", () => {
 
   it("sends Inbox ideas to the environment hosting an Inbox", () => {
     expect(
-      resolveBacklogCreateTarget(resolveBacklogScope(scopes, "inbox"), [LAPTOP, GEEKOM]),
-    ).toEqual({
-      environmentId: GEEKOM,
-      input: { backlogId: "inbox-g" },
-    });
+      resolveBacklogCreateTarget(resolveBacklogScope(scopes, "inbox"), [env(LAPTOP), env(GEEKOM)])
+        .target,
+    ).toEqual({ environmentId: GEEKOM, input: { backlogId: "inbox-g" } });
   });
 
-  it("creates the Inbox on the first connected environment when none exists", () => {
+  it("creates the Inbox on the first ready environment when none exists", () => {
     const empty = buildBacklogScopes({ boards: [], projectGroups: [] });
-    expect(resolveBacklogCreateTarget(resolveBacklogScope(empty, "all"), [LAPTOP])).toEqual({
-      environmentId: LAPTOP,
-      input: {},
+    expect(
+      resolveBacklogCreateTarget(resolveBacklogScope(empty, "all"), [env(LAPTOP)]).target,
+    ).toEqual({ environmentId: LAPTOP, input: {} });
+    expect(resolveBacklogCreateTarget(resolveBacklogScope(empty, "inbox"), [])).toMatchObject({
+      target: null,
+      loading: false,
     });
-    expect(resolveBacklogCreateTarget(resolveBacklogScope(empty, "inbox"), [])).toBeNull();
+    expect(
+      resolveBacklogCreateTarget(resolveBacklogScope(empty, "inbox"), [env(LAPTOP, "loading")]),
+    ).toEqual({ target: null, blockedReason: "Loading Laptop…", loading: true });
   });
 
-  it("uses the project's existing backlog, else a connected checkout", () => {
+  it("uses the project's existing backlog, else a checkout once every checkout has answered", () => {
     expect(
       resolveBacklogCreateTarget(resolveBacklogScope(scopes, "project:repo:wine"), [
-        LAPTOP,
-        GEEKOM,
-      ]),
+        env(LAPTOP),
+        env(GEEKOM),
+      ]).target,
     ).toEqual({ environmentId: GEEKOM, input: { backlogId: "wine" } });
+    const unseen = buildBacklogScopes({
+      boards: [{ environmentId: LAPTOP, board: EMPTY_BACKLOG_BOARD }],
+      projectGroups: [wineGroup, notesGroup],
+    });
+    const wine = resolveBacklogScope(unseen, "project:repo:wine");
+    expect(resolveBacklogCreateTarget(wine, [env(LAPTOP), env(GEEKOM)]).target).toEqual({
+      environmentId: LAPTOP,
+      input: { projectId: WINE_ON_LAPTOP },
+    });
     expect(
-      resolveBacklogCreateTarget(resolveBacklogScope(scopes, "project:repo:wine"), [LAPTOP]),
-    ).toEqual({ environmentId: LAPTOP, input: { projectId: WINE_ON_LAPTOP } });
-    expect(
-      resolveBacklogCreateTarget(resolveBacklogScope(scopes, "project:repo:notes"), [GEEKOM]),
-    ).toBeNull();
+      resolveBacklogCreateTarget(resolveBacklogScope(unseen, "project:repo:notes"), [env(GEEKOM)]),
+    ).toMatchObject({ target: null, loading: false });
+  });
+
+  it("never creates a second backlog while a checkout's board is loading or offline", () => {
+    const unseen = buildBacklogScopes({
+      boards: [{ environmentId: LAPTOP, board: EMPTY_BACKLOG_BOARD }],
+      projectGroups: [wineGroup],
+    });
+    const wine = resolveBacklogScope(unseen, "project:repo:wine");
+    expect(resolveBacklogCreateTarget(wine, [env(LAPTOP), env(GEEKOM, "loading")])).toEqual({
+      target: null,
+      blockedReason: "Loading Geekom…",
+      loading: true,
+    });
+    expect(resolveBacklogCreateTarget(wine, [env(LAPTOP), env(GEEKOM, "offline")])).toEqual({
+      target: null,
+      blockedReason: "Geekom may hold this backlog and is offline.",
+      loading: false,
+    });
+    expect([
+      ...creatableProjectIdsOn(unseen, [env(LAPTOP), env(GEEKOM, "offline")], LAPTOP),
+    ]).toEqual([]);
+    expect([...creatableProjectIdsOn(unseen, [env(LAPTOP), env(GEEKOM)], LAPTOP)]).toEqual([
+      WINE_ON_LAPTOP,
+    ]);
   });
 
   it("defaults quick-add to the board's project, else the Inbox", () => {
@@ -355,7 +397,13 @@ describe("issue actions", () => {
       { id: apps, title: "Apps" },
     ];
 
-    const fromInbox = backlogMoveTargets(state, { backlogId: BacklogId.make("inbox") }, projects);
+    const creatable = new Set([notes]);
+    const fromInbox = backlogMoveTargets(
+      state,
+      { backlogId: BacklogId.make("inbox") },
+      projects,
+      creatable,
+    );
     expect(fromInbox.map((target) => [target.label, target.patch])).toEqual([
       ["Apps", { backlogId: "apps-backlog" }],
       ["Cork & Note", { backlogId: "wine-backlog" }],
@@ -367,6 +415,7 @@ describe("issue actions", () => {
       state,
       { backlogId: BacklogId.make("wine-backlog") },
       projects,
+      creatable,
     );
     expect(fromWine.map((target) => target.label)).toEqual([
       "Inbox",
@@ -374,6 +423,17 @@ describe("issue actions", () => {
       "Notes",
       "Old project",
     ]);
+  });
+
+  it("offers a project without a backlog only where creating one is safe", () => {
+    const notes = ProjectId.make("notes");
+    const targets = backlogMoveTargets(
+      board([backlog("inbox", "inbox", "Inbox")], []),
+      { backlogId: BacklogId.make("inbox") },
+      [{ id: notes, title: "Notes" }],
+      new Set(),
+    );
+    expect(targets).toEqual([]);
   });
 
   it("reopens to the column the issue would have started in", () => {

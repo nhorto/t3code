@@ -407,6 +407,9 @@ export function summarizeT3ToolCalls(
     case "backlog-claim":
       label = phrase("Claimed or released", "claim", quantity(selected.length, "backlog issue"));
       break;
+    case "agent-message":
+      label = phrase("Sent", "send", quantity(selected.length, "agent message"));
+      break;
   }
   return { label, failedCount };
 }

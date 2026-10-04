@@ -1,6 +1,7 @@
 import {
   Backlog,
   BacklogActivity,
+  BacklogClaimResult,
   BacklogError,
   BacklogIssue,
   BacklogIssueDetail,
@@ -15,19 +16,21 @@ import {
 import * as Schema from "effect/Schema";
 import { Tool, Toolkit } from "effect/unstable/ai";
 
+import * as BacklogRouter from "../../../backlog/BacklogRouter.ts";
 import * as BacklogService from "../../../backlog/BacklogService.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 
 const IssueRef = TrimmedNonEmptyString.annotate({
-  description: "An issue id, or its key such as WINE-12 (case-insensitive).",
+  description:
+    "An issue id, or its key such as WINE-12 (case-insensitive). Issues on the linked backlog hub resolve too.",
 });
 const BacklogRef = TrimmedNonEmptyString.annotate({
   description: "A backlog id, or its key such as WINE or INBOX (case-insensitive).",
 });
 const ProjectTarget = ProjectId.annotate({
   description:
-    "A project id from t3_project_list. Targets that project's backlog, creating it on first use.",
+    "A project id from t3_project_list. Targets that project's backlog: the one on this machine if it has one, else the backlog hub's for the same repository when this machine is linked to a hub.",
 });
 
 const shared = {
@@ -37,8 +40,26 @@ const shared = {
     McpInvocationContext.McpInvocationContext,
     ThreadManagementService.ThreadManagementService,
     BacklogService.BacklogService,
+    BacklogRouter.BacklogRouter,
   ],
 };
+
+/** Where a row lives: this machine, or the backlog hub it is linked to. */
+const Host = Schema.Literals(["local", "hub"]).annotate({
+  description:
+    "local: this machine. hub: the backlog hub this machine is linked to; calls on it go there automatically.",
+});
+
+const HubNote = Schema.NullOr(
+  Schema.Struct({
+    label: Schema.String,
+    state: Schema.Literals(["connected", "unavailable"]),
+    message: Schema.NullOr(Schema.String),
+  }),
+).annotate({
+  description:
+    "The linked backlog hub, if any. unavailable means its rows are missing from this answer; retry later.",
+});
 
 const BacklogGuideTool = Tool.make("backlog_guide", {
   ...shared,
@@ -54,8 +75,11 @@ const BacklogGuideTool = Tool.make("backlog_guide", {
 const ListBacklogsTool = Tool.make("backlog_list_backlogs", {
   ...shared,
   description:
-    "List the backlogs on this environment: the personal Inbox and one per project that has used one. Keys such as WINE prefix issue keys (WINE-12).",
-  success: Schema.Struct({ backlogs: Schema.Array(Backlog) }),
+    "List the backlogs: this machine's Inbox and project backlogs, plus the backlog hub's when this machine is linked to one (host says which). Keys such as WINE prefix issue keys (WINE-12). Both machines have an INBOX; a key resolves on this machine first, so use the id for the hub's.",
+  success: Schema.Struct({
+    backlogs: Schema.Array(Schema.Struct({ ...Backlog.fields, host: Host })),
+    hub: HubNote,
+  }),
 })
   .annotate(Tool.Title, "List backlogs")
   .annotate(Tool.Readonly, true)
@@ -65,7 +89,7 @@ const ListBacklogsTool = Tool.make("backlog_list_backlogs", {
 const ListIssuesTool = Tool.make("backlog_list_issues", {
   ...shared,
   description:
-    "List backlog issues as board rows without bodies; use backlog_get_issue for the body, children, blockers, and history. frontierOnly lists only issues an agent may claim: ready, unblocked, and unclaimed. An issue is blocked while any issue in blockedBy is not done or wontfix.",
+    "List backlog issues as board rows without bodies; use backlog_get_issue for the body, children, blockers, and history. frontierOnly lists only issues an agent may claim: ready, unblocked, and unclaimed. An issue is blocked while any issue in blockedBy is not done or wontfix. Without a backlog, project, or parent, lists this machine's issues and the linked hub's. Never creates a backlog.",
   parameters: Schema.Struct({
     backlog: Schema.optional(BacklogRef),
     projectId: Schema.optional(ProjectTarget),
@@ -80,8 +104,9 @@ const ListIssuesTool = Tool.make("backlog_list_issues", {
     ),
   }),
   success: Schema.Struct({
-    issues: Schema.Array(BacklogIssue),
+    issues: Schema.Array(Schema.Struct({ ...BacklogIssue.fields, host: Host })),
     total: Schema.Int.annotate({ description: "Matching issues before the limit." }),
+    hub: HubNote,
   }),
 })
   .annotate(Tool.Title, "List backlog issues")
@@ -104,7 +129,7 @@ const GetIssueTool = Tool.make("backlog_get_issue", {
 const CreateIssueTool = Tool.make("backlog_create_issue", {
   ...shared,
   description:
-    "Add an idea, bug, or feature to a backlog. Use this when the user says something like \"add a bug to Cork & Note: paywall crashes on iPad\": find the project's id with t3_project_list and pass it as projectId. Pass backlog to target a backlog by key or id instead. With neither, the issue lands in the personal Inbox for later triage. Keep the user's wording for the title; put detail in body. Status defaults to inbox in the Inbox and backlog in a project.",
+    "Add an idea, bug, or feature to a backlog. Use this when the user says something like \"add a bug to Cork & Note: paywall crashes on iPad\": find the project's id with t3_project_list and pass it as projectId. Pass backlog to target a backlog by key or id instead. With only parent, it joins the parent's backlog. With none of these, the issue lands in the personal Inbox for later triage. When this machine is linked to a backlog hub, new project backlogs and Inbox ideas are created on the hub (a project's existing backlog on this machine stays here). Keep the user's wording for the title; put detail in body. Status defaults to inbox in the Inbox and backlog in a project.",
   parameters: Schema.Struct({
     projectId: Schema.optional(ProjectTarget),
     backlog: Schema.optional(BacklogRef),
@@ -174,9 +199,9 @@ const UpdateIssueTool = Tool.make("backlog_update_issue", {
 const ClaimTool = Tool.make("backlog_claim", {
   ...shared,
   description:
-    "Claim an issue for this thread before working on it. Only frontier issues (ready, unblocked, unclaimed) can be claimed, and a claim is exclusive across every agent and machine; a conflict means someone else has it, so pick another. Claiming moves the issue to in_progress, links this thread, and returns the issue with its parent's spec. The claim is a lease that renews while this thread runs and whenever it calls a backlog tool; it expires about 15 minutes after the thread stops. Re-claiming an issue you hold is safe.",
+    "Claim an issue for this thread before working on it. Only frontier issues (ready, unblocked, unclaimed) can be claimed, and a claim is exclusive across every agent and machine; a conflict means someone else has it, so pick another. Claiming moves the issue to in_progress, links this thread, and returns the issue with its parent's spec. The claim is a lease: it holds while this thread is running or was active in the last 2 hours (so stopping to ask the user a question keeps it), and expires about 15 minutes after that. Re-claiming an issue this thread holds is safe and returns alreadyHeld: true. A claim belongs to a T3 thread, so workers sharing one thread (a provider's built-in subagents) cannot hold separate claims; if you get alreadyHeld: true without having claimed the issue yourself, another worker in this thread has it.",
   parameters: Schema.Struct({ issue: IssueRef }),
-  success: BacklogIssueDetail,
+  success: BacklogClaimResult,
 })
   .annotate(Tool.Title, "Claim a backlog issue")
   .annotate(Tool.Destructive, false)
@@ -185,14 +210,14 @@ const ClaimTool = Tool.make("backlog_claim", {
 const ClaimNextTool = Tool.make("backlog_claim_next", {
   ...shared,
   description:
-    "Claim the next frontier issue: highest priority first, then oldest. Narrow it with backlog, projectId, parent (children of one spec), or type. Returns claimed: null when nothing is claimable. Same lease rules as backlog_claim.",
+    "Claim the next frontier issue: highest priority first, then oldest. Narrow it with backlog, projectId, parent (children of one spec), or type; without them, this machine's backlogs are tried before the linked hub's. Returns claimed: null when nothing is claimable. Never creates a backlog. Same lease rules as backlog_claim.",
   parameters: Schema.Struct({
     backlog: Schema.optional(BacklogRef),
     projectId: Schema.optional(ProjectTarget),
     parent: Schema.optional(IssueRef),
     type: Schema.optional(BacklogIssueType),
   }),
-  success: Schema.Struct({ claimed: Schema.NullOr(BacklogIssueDetail) }),
+  success: Schema.Struct({ claimed: Schema.NullOr(BacklogClaimResult) }),
 })
   .annotate(Tool.Title, "Claim the next backlog issue")
   .annotate(Tool.Destructive, false);
@@ -224,7 +249,7 @@ const CommentTool = Tool.make("backlog_comment", {
 const LinkPullRequestTool = Tool.make("backlog_link_pull_request", {
   ...shared,
   description:
-    "Link a pull request URL to an issue. Without issue, links it to every issue this thread currently holds. link_pull_request already does this for held issues, so call this only for other issues.",
+    "Link a pull request URL to an issue. Without issue, links it to every issue this thread currently holds, here and on the linked hub. link_pull_request already does this for held issues, so call this only for other issues.",
   parameters: Schema.Struct({
     url: TrimmedNonEmptyString.annotate({ description: "The pull request's web URL." }),
     issue: Schema.optional(IssueRef),

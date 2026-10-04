@@ -1,6 +1,9 @@
 import {
   type DeviceListInput,
   AuthAccessReadScope,
+  AuthAccessWriteScope,
+  AuthBacklogReadScope,
+  AuthBacklogWriteScope,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   AuthRelayReadScope,
@@ -10,6 +13,7 @@ import {
   ORCHESTRATION_V2_WS_METHODS,
   type AuthEnvironmentScope,
   EnvironmentAuthorizationError,
+  hasAuthScope,
   RpcScopeAuthorization,
   WS_METHODS,
   WsRpcGroup,
@@ -94,13 +98,30 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.scheduledTasksSetEnabled]: AuthOrchestrationOperateScope,
   [WS_METHODS.scheduledTasksDelete]: AuthOrchestrationOperateScope,
   [WS_METHODS.scheduledTasksRunNow]: AuthOrchestrationOperateScope,
-  [WS_METHODS.backlogSubscribe]: AuthOrchestrationReadScope,
-  [WS_METHODS.backlogGetIssue]: AuthOrchestrationReadScope,
-  [WS_METHODS.backlogCreateIssue]: AuthOrchestrationOperateScope,
-  [WS_METHODS.backlogUpdateIssue]: AuthOrchestrationOperateScope,
-  [WS_METHODS.backlogComment]: AuthOrchestrationOperateScope,
-  [WS_METHODS.backlogRelease]: AuthOrchestrationOperateScope,
-  [WS_METHODS.backlogUpdateBacklog]: AuthOrchestrationOperateScope,
+  // Orchestration sessions hold these through hasAuthScope; a linked server's
+  // session holds only these.
+  [WS_METHODS.backlogSubscribe]: AuthBacklogReadScope,
+  [WS_METHODS.backlogGetIssue]: AuthBacklogReadScope,
+  [WS_METHODS.backlogCreateIssue]: AuthBacklogWriteScope,
+  [WS_METHODS.backlogUpdateIssue]: AuthBacklogWriteScope,
+  [WS_METHODS.backlogComment]: AuthBacklogWriteScope,
+  [WS_METHODS.backlogRelease]: AuthBacklogWriteScope,
+  [WS_METHODS.backlogUpdateBacklog]: AuthBacklogWriteScope,
+  [WS_METHODS.backlogListBacklogs]: AuthBacklogReadScope,
+  [WS_METHODS.backlogListIssues]: AuthBacklogReadScope,
+  [WS_METHODS.backlogResolveIssue]: AuthBacklogReadScope,
+  [WS_METHODS.backlogCreateChildren]: AuthBacklogWriteScope,
+  [WS_METHODS.backlogClaim]: AuthBacklogWriteScope,
+  [WS_METHODS.backlogClaimNext]: AuthBacklogWriteScope,
+  [WS_METHODS.backlogRenewClaims]: AuthBacklogWriteScope,
+  [WS_METHODS.backlogLinkPullRequest]: AuthBacklogWriteScope,
+  // The hub link is this server's credential for another machine.
+  [WS_METHODS.backlogGetHubLink]: AuthAccessReadScope,
+  [WS_METHODS.backlogLinkHub]: AuthAccessWriteScope,
+  [WS_METHODS.backlogUnlinkHub]: AuthAccessWriteScope,
+  [WS_METHODS.agentMessagesSubscribe]: AuthOrchestrationReadScope,
+  [WS_METHODS.agentMessagesRelease]: AuthOrchestrationOperateScope,
+  [WS_METHODS.agentMessagesDismiss]: AuthOrchestrationOperateScope,
   [WS_METHODS.cloudGetRelayClientStatus]: AuthRelayReadScope,
   [WS_METHODS.cloudInstallRelayClient]: AuthRelayWriteScope,
   [WS_METHODS.pullRequestsList]: AuthOrchestrationReadScope,
@@ -233,7 +254,7 @@ export const rpcAuthorizationError = (requiredScope: AuthEnvironmentScope) =>
 export const rpcScopeAuthorizationLayer = (scopes: ReadonlyArray<AuthEnvironmentScope>) =>
   Layer.succeed(RpcScopeAuthorization)((effect, { rpc }) => {
     const requiredScope = requiredScopeForRpcMethod(rpc._tag);
-    return scopes.includes(requiredScope)
+    return hasAuthScope(scopes, requiredScope)
       ? effect
       : Effect.fail(rpcAuthorizationError(requiredScope));
   });

@@ -20,12 +20,16 @@ import {
   blockerCandidates,
   buildBacklogColumns,
   buildBacklogSwitcher,
+  creatableProjectIdsOn,
   describeBacklogActivity,
   matchesBacklogFilters,
   normalizeBacklogKeyInput,
   openBlockerKeys,
+  pageBacklogColumn,
   parseBacklogScope,
+  prunePendingBacklogMoves,
   resolveBacklogSourceStatus,
+  sameBacklogSwitcherSources,
   type BacklogSource,
 } from "./backlog.logic";
 
@@ -232,6 +236,111 @@ describe("buildBacklogSwitcher", () => {
     expect(entries.find((entry) => entry.label === "Cork & Note")?.createTarget).toBeNull();
   });
 
+  describe("never splits a project across two backlogs", () => {
+    // The Mac has a checkout; the Geekom has one too and may already hold the backlog.
+    const projects = [
+      project(),
+      project({
+        environmentId: geekom,
+        id: ProjectId.make("project-wine-geekom"),
+        workspaceRoot: "/srv/cork-and-note",
+      }),
+    ];
+    const wineEntry = (geekomSource: BacklogSource) =>
+      buildBacklogSwitcher({
+        sources: [source({ environmentId: mac }), geekomSource],
+        projects,
+        groupingSettings,
+        primaryEnvironmentId: mac,
+      }).find((entry) => entry.label === "Cork & Note");
+
+    it("waits while a machine with a checkout is still loading its board", () => {
+      const wine = wineEntry(source({ environmentId: geekom, status: "loading", board: null }));
+      expect(wine?.createTarget).toBeNull();
+      expect(wine?.createBlockedReason).toBe("Loading Geekom…");
+    });
+
+    it("refuses while a machine with a checkout is offline and unseen", () => {
+      const wine = wineEntry(source({ environmentId: geekom, status: "unavailable", board: null }));
+      expect(wine?.createTarget).toBeNull();
+      expect(wine?.createBlockedReason).toBe("Geekom may hold this backlog and is offline.");
+    });
+
+    it("names the offline machine that holds the backlog", () => {
+      const wine = wineEntry(
+        source({ environmentId: geekom, status: "stale", board: board([wineBacklog], []) }),
+      );
+      expect(wine?.createTarget).toBeNull();
+      expect(wine?.createBlockedReason).toBe("Geekom holds this backlog and is offline.");
+    });
+
+    it("creates by project once every checkout has answered without one", () => {
+      const wine = wineEntry(source({ environmentId: geekom }));
+      expect(wine?.createTarget).toEqual({
+        environmentId: mac,
+        projectId: ProjectId.make("project-wine-mac"),
+      });
+      expect(wine?.createBlockedReason).toBeNull();
+    });
+  });
+
+  it("says the Inbox is loading rather than unreachable", () => {
+    const inbox = buildBacklogSwitcher({
+      sources: [source({ environmentId: mac, status: "loading", board: null })],
+      projects: [],
+      groupingSettings,
+      primaryEnvironmentId: mac,
+    }).find((entry) => entry.key === "inbox");
+    expect(inbox?.createTarget).toBeNull();
+    expect(inbox?.createBlockedReason).toBe("Loading MacBook…");
+  });
+
+  it("counts open issues per entry", () => {
+    const entries = buildBacklogSwitcher({
+      sources: [
+        source({
+          environmentId: geekom,
+          board: board(
+            [wineBacklog],
+            [
+              issue({ id: "open" }),
+              issue({ id: "ready", status: "ready" }),
+              issue({ id: "shipped", status: "done" }),
+            ],
+          ),
+        }),
+      ],
+      projects: [project({ environmentId: geekom, id: ProjectId.make("project-wine-geekom") })],
+      groupingSettings,
+      primaryEnvironmentId: mac,
+    });
+    expect(entries.find((entry) => entry.label === "Cork & Note")?.openCount).toBe(2);
+    expect(entries.find((entry) => entry.key === "all")?.openCount).toBe(2);
+  });
+
+  it("rebuilds the grouping only when backlogs or connection state change", () => {
+    const geekomBoard = board([wineBacklog], [issue({ id: "a" })]);
+    const before = [source({ environmentId: geekom, board: geekomBoard })];
+    // An issue delta keeps the backlogs array.
+    const issueDelta = [
+      source({
+        environmentId: geekom,
+        board: { ...geekomBoard, issues: [issue({ id: "a", status: "ready" })] },
+      }),
+    ];
+    expect(sameBacklogSwitcherSources(before, issueDelta)).toBe(true);
+    expect(
+      sameBacklogSwitcherSources(before, [
+        source({ environmentId: geekom, board: board([wineBacklog], []) }),
+      ]),
+    ).toBe(false);
+    expect(
+      sameBacklogSwitcherSources(before, [
+        source({ environmentId: geekom, status: "stale", board: geekomBoard }),
+      ]),
+    ).toBe(false);
+  });
+
   it("names machines only when two entries share a label", () => {
     const entries = buildBacklogSwitcher({
       sources: [source({ environmentId: mac }), source({ environmentId: geekom })],
@@ -376,6 +485,55 @@ describe("board columns", () => {
   });
 });
 
+describe("closed columns", () => {
+  const done = Array.from({ length: 95 }, (_, index) => ({
+    environmentId: mac,
+    issue: issue({ id: `done-${index}`, status: "done" }),
+  }));
+
+  it("draws the newest closed cards and counts the rest", () => {
+    const page = pageBacklogColumn({ status: "done", issues: done }, 30);
+    expect(page.visible).toHaveLength(30);
+    expect(page.visible[0]?.issue.id).toBe("done-0");
+    expect(page.hidden).toBe(65);
+    expect(pageBacklogColumn({ status: "done", issues: done }, 130).hidden).toBe(0);
+  });
+
+  it("never pages an open column", () => {
+    const ready = done.map((item) => ({
+      ...item,
+      issue: { ...item.issue, status: "ready" as const },
+    }));
+    expect(pageBacklogColumn({ status: "ready", issues: ready }, 30).hidden).toBe(0);
+  });
+});
+
+describe("pending moves", () => {
+  const row = issue({ id: "moved", status: "backlog", updatedAt: "2026-01-01T00:00:00.000Z" });
+  const pending = new Map([
+    [`${mac}:moved`, { status: "ready" as const, fromUpdatedAt: row.updatedAt }],
+  ]);
+  const sourcesWith = (moved: BacklogIssue) => [
+    source({ environmentId: mac, board: board([wineBacklog], [moved]) }),
+  ];
+
+  it("keeps a move the server has not answered, without a new map", () => {
+    expect(prunePendingBacklogMoves(pending, sourcesWith(row))).toBe(pending);
+  });
+
+  it("drops a move once the row moves on or already shows the status", () => {
+    expect(
+      prunePendingBacklogMoves(
+        pending,
+        sourcesWith({ ...row, updatedAt: "2026-01-01T00:00:01.000Z" }),
+      ).size,
+    ).toBe(0);
+    expect(prunePendingBacklogMoves(pending, sourcesWith({ ...row, status: "ready" })).size).toBe(
+      0,
+    );
+  });
+});
+
 describe("cards", () => {
   it("lists only open blockers, and counts an unknown one as open", () => {
     const done = issue({ id: "done", key: "WINE-1", status: "done" });
@@ -457,6 +615,7 @@ describe("backlogMoveTargets", () => {
         { id: ProjectId.make("p-wine"), title: "Cork & Note" },
         { id: ProjectId.make("p-fripp"), title: "Fripp Island" },
       ],
+      creatableProjectIds: new Set([ProjectId.make("p-fripp")]),
     });
     expect(targets.map((target) => [target.label, target.input])).toEqual([
       ["Cork & Note (WINE)", { backlogId: wine.id }],
@@ -469,7 +628,41 @@ describe("backlogMoveTargets", () => {
       currentBacklogId: BacklogId.make("backlog-wine"),
       backlogs: [backlog({ id: BacklogId.make("backlog-wine"), kind: "project" }), backlog()],
       projects: [{ id: ProjectId.make("p-api"), title: "API" }],
+      creatableProjectIds: new Set([ProjectId.make("p-api")]),
     });
     expect(targets.map((target) => target.label)).toEqual(["Inbox", "API"]);
+  });
+
+  it("moves by project only where that cannot split the project's backlog", () => {
+    // The Mac's checkout has its backlog homed on the Geekom; the API has none anywhere yet.
+    const entries = buildBacklogSwitcher({
+      sources: [
+        source({ environmentId: mac }),
+        source({ environmentId: geekom, board: board([wineBacklog], []) }),
+      ],
+      projects: [
+        project(),
+        project({
+          id: ProjectId.make("p-api"),
+          title: "API",
+          workspaceRoot: "/api",
+          repositoryIdentity: null,
+        }),
+      ],
+      groupingSettings,
+      primaryEnvironmentId: mac,
+    });
+    const creatable = creatableProjectIdsOn(entries, mac);
+    expect([...creatable]).toEqual([ProjectId.make("p-api")]);
+    const targets = backlogMoveTargets({
+      currentBacklogId: BacklogId.make("inbox-mac"),
+      backlogs: [backlog({ id: BacklogId.make("inbox-mac") })],
+      projects: [
+        { id: ProjectId.make("project-wine-mac"), title: "Cork & Note" },
+        { id: ProjectId.make("p-api"), title: "API" },
+      ],
+      creatableProjectIds: creatable,
+    });
+    expect(targets.map((target) => target.label)).toEqual(["API"]);
   });
 });

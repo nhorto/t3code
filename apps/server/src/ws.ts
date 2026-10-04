@@ -120,6 +120,9 @@ import * as ThreadMessageIntake from "./orchestration-v2/ThreadMessageIntake.ts"
 import * as IdAllocator from "./orchestration-v2/IdAllocator.ts";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 import * as BacklogService from "./backlog/BacklogService.ts";
+import * as BacklogHubClient from "./backlog/BacklogHubClient.ts";
+import { localBacklogHome } from "./backlog/BacklogHome.ts";
+import * as AgentMessageService from "./agentMessages/AgentMessageService.ts";
 import {
   archivedShellStreamItemFromThreadShell,
   buildActiveShellSnapshot,
@@ -1217,6 +1220,9 @@ const makeWsRpcLayer = (
       const providerSessionManager = yield* ProviderSessionManager.ProviderSessionManagerV2;
       const scheduledTasks = yield* ScheduledTasks.ScheduledTaskService;
       const backlog = yield* BacklogService.BacklogService;
+      const backlogHome = localBacklogHome(backlog);
+      const backlogHub = yield* BacklogHubClient.BacklogHubClient;
+      const agentMessages = yield* AgentMessageService.AgentMessageService;
       const pullRequests = yield* PullRequestService.PullRequestService;
       const pullRequestSync = yield* PullRequestSyncReactor.PullRequestSyncReactor;
       const deviceService = yield* DeviceService.DeviceService;
@@ -2081,30 +2087,114 @@ const makeWsRpcLayer = (
             "backlog.issue_id": input.issueId,
           }),
         [WS_METHODS.backlogCreateIssue]: (input) =>
-          observeRpcEffect(WS_METHODS.backlogCreateIssue, backlog.createIssue(input, backlogUser), {
-            "rpc.aggregate": "backlog",
-          }),
+          observeRpcEffect(
+            WS_METHODS.backlogCreateIssue,
+            backlog.createIssue(input, input.actor ?? backlogUser),
+            {
+              "rpc.aggregate": "backlog",
+            },
+          ),
         [WS_METHODS.backlogUpdateIssue]: (input) =>
-          observeRpcEffect(WS_METHODS.backlogUpdateIssue, backlog.updateIssue(input, backlogUser), {
-            "rpc.aggregate": "backlog",
-            "backlog.issue_id": input.issueId,
-          }),
+          observeRpcEffect(
+            WS_METHODS.backlogUpdateIssue,
+            backlog.updateIssue(input, input.actor ?? backlogUser),
+            {
+              "rpc.aggregate": "backlog",
+              "backlog.issue_id": input.issueId,
+            },
+          ),
         [WS_METHODS.backlogComment]: (input) =>
-          observeRpcEffect(WS_METHODS.backlogComment, backlog.comment(input, backlogUser), {
-            "rpc.aggregate": "backlog",
-            "backlog.issue_id": input.issueId,
-          }),
+          observeRpcEffect(
+            WS_METHODS.backlogComment,
+            backlog.comment(input, input.actor ?? backlogUser),
+            {
+              "rpc.aggregate": "backlog",
+              "backlog.issue_id": input.issueId,
+            },
+          ),
         [WS_METHODS.backlogRelease]: (input) =>
-          observeRpcEffect(WS_METHODS.backlogRelease, backlog.release(input, backlogUser), {
-            "rpc.aggregate": "backlog",
-            "backlog.issue_id": input.issueId,
-          }),
+          observeRpcEffect(
+            WS_METHODS.backlogRelease,
+            backlog.release(input, input.actor ?? backlogUser),
+            {
+              "rpc.aggregate": "backlog",
+              "backlog.issue_id": input.issueId,
+            },
+          ),
         [WS_METHODS.backlogUpdateBacklog]: (input) =>
           observeRpcEffect(
             WS_METHODS.backlogUpdateBacklog,
             backlog.updateBacklog(input, backlogUser),
             { "rpc.aggregate": "backlog" },
           ),
+        // Called by a linked server for its agents, who arrive as input.actor.
+        [WS_METHODS.backlogListBacklogs]: (_input) =>
+          observeRpcEffect(WS_METHODS.backlogListBacklogs, backlog.listBacklogs(), {
+            "rpc.aggregate": "backlog",
+          }),
+        [WS_METHODS.backlogListIssues]: (input) =>
+          observeRpcEffect(WS_METHODS.backlogListIssues, backlog.listIssues(input), {
+            "rpc.aggregate": "backlog",
+          }),
+        [WS_METHODS.backlogResolveIssue]: (input) =>
+          observeRpcEffect(WS_METHODS.backlogResolveIssue, backlog.resolveIssueRef(input.ref), {
+            "rpc.aggregate": "backlog",
+          }),
+        [WS_METHODS.backlogCreateChildren]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.backlogCreateChildren,
+            backlog.createChildren(input, input.actor ?? backlogUser),
+            { "rpc.aggregate": "backlog", "backlog.issue_id": input.parentId },
+          ),
+        [WS_METHODS.backlogClaim]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.backlogClaim,
+            backlog.claim(input, input.actor ?? backlogUser),
+            {
+              "rpc.aggregate": "backlog",
+              "backlog.issue_id": input.issueId,
+            },
+          ),
+        [WS_METHODS.backlogClaimNext]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.backlogClaimNext,
+            backlog.claimNext(input, input.actor ?? backlogUser),
+            { "rpc.aggregate": "backlog" },
+          ),
+        [WS_METHODS.backlogRenewClaims]: (input) =>
+          observeRpcEffect(WS_METHODS.backlogRenewClaims, backlog.renewClaims(input), {
+            "rpc.aggregate": "backlog",
+          }),
+        [WS_METHODS.backlogLinkPullRequest]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.backlogLinkPullRequest,
+            backlogHome.linkPullRequest(input, input.actor ?? backlogUser),
+            { "rpc.aggregate": "backlog" },
+          ),
+        [WS_METHODS.backlogGetHubLink]: (_input) =>
+          observeRpcEffect(WS_METHODS.backlogGetHubLink, backlogHub.status(), {
+            "rpc.aggregate": "backlog",
+          }),
+        [WS_METHODS.backlogLinkHub]: (input) =>
+          observeRpcEffect(WS_METHODS.backlogLinkHub, backlogHub.link(input), {
+            "rpc.aggregate": "backlog",
+          }),
+        [WS_METHODS.backlogUnlinkHub]: (_input) =>
+          observeRpcEffect(WS_METHODS.backlogUnlinkHub, backlogHub.unlink(), {
+            "rpc.aggregate": "backlog",
+          }),
+        [WS_METHODS.agentMessagesSubscribe]: (_input) =>
+          observeRpcStream(WS_METHODS.agentMessagesSubscribe, agentMessages.subscribe(), {
+            "rpc.aggregate": "agentMessages",
+          }),
+        [WS_METHODS.agentMessagesRelease]: (input) =>
+          observeRpcEffect(WS_METHODS.agentMessagesRelease, agentMessages.release(input), {
+            "rpc.aggregate": "agentMessages",
+          }),
+        [WS_METHODS.agentMessagesDismiss]: (input) =>
+          observeRpcEffect(WS_METHODS.agentMessagesDismiss, agentMessages.dismiss(input), {
+            "rpc.aggregate": "agentMessages",
+          }),
         [WS_METHODS.serverProbe]: (_input) =>
           observeRpcEffect(WS_METHODS.serverProbe, Effect.succeed({}), {
             "rpc.aggregate": "server",

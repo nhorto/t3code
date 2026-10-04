@@ -23,7 +23,7 @@ import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
-import * as BacklogService from "../../../backlog/BacklogService.ts";
+import * as BacklogRouter from "../../../backlog/BacklogRouter.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -157,16 +157,20 @@ const make = Effect.gen(function* () {
   const projects = yield* ProjectService.ProjectService;
   const crypto = yield* Crypto.Crypto;
   // Optional so hosts without a backlog (and tests) keep linking pull requests.
-  const backlog = yield* Effect.serviceOption(BacklogService.BacklogService);
+  const backlog = yield* Effect.serviceOption(BacklogRouter.BacklogRouter);
 
-  /** A linked pull request also lands on every backlog issue the thread holds; best-effort. */
+  /**
+   * A linked pull request also lands on every backlog issue the thread holds,
+   * here and on a linked hub. Best-effort: it must never fail the link itself,
+   * and storage failures are defects, so the whole cause is caught.
+   */
   const linkToClaimedIssues = (thread: OrchestrationV2ThreadShell, url: string) =>
     Option.match(backlog, {
       onNone: () => Effect.void,
-      onSome: (service) =>
+      onSome: (router) =>
         McpInvocationContext.McpInvocationContext.pipe(
           Effect.flatMap((scope) =>
-            service.linkPullRequestToClaims(
+            router.linkPullRequest(
               { url },
               {
                 kind: "agent",
@@ -176,7 +180,12 @@ const make = Effect.gen(function* () {
               },
             ),
           ),
-          Effect.ignore,
+          Effect.asVoid,
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Could not link the pull request to claimed backlog issues", {
+              cause,
+            }),
+          ),
         ),
     });
 

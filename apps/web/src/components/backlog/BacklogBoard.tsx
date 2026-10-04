@@ -14,12 +14,15 @@ import type { BacklogIssueId, BacklogIssueStatus, EnvironmentId } from "@t3tools
 import { useMemo, useState, type ReactNode } from "react";
 
 import { cn } from "../../lib/utils";
+import { Button } from "../ui/button";
 import {
   BACKLOG_STATUS_LABELS,
+  CLOSED_COLUMN_PAGE,
   backlogChildProgress,
   boardIssueKey,
   isBacklogSourceWritable,
   openBlockerKeys,
+  pageBacklogColumn,
   type BacklogChildProgress,
   type BacklogColumn,
   type BacklogSource,
@@ -32,7 +35,7 @@ import {
   type BacklogDragData,
 } from "./BacklogCard";
 
-type CardDerivedProps = Omit<BacklogCardProps, "selected" | "readOnly" | "onOpen">;
+type CardDerivedProps = Omit<BacklogCardProps, "status" | "selected" | "readOnly" | "onOpen">;
 
 interface SourceIndex {
   readonly source: BacklogSource;
@@ -112,7 +115,8 @@ export function BacklogBoard({
     setActive(null);
     const data = event.active.data.current as BacklogDragData | undefined;
     const status = event.over?.id as BacklogIssueStatus | undefined;
-    if (!data || !status || status === data.issue.status) return;
+    // The column the card is drawn in, so dragging back during a pending move still sends.
+    if (!data || !status || status === data.status) return;
     onMove({ environmentId: data.environmentId, issue: data.issue }, status);
   };
 
@@ -136,6 +140,7 @@ export function BacklogBoard({
                 <BacklogCard
                   key={key}
                   {...cardProps(item)}
+                  status={column.status}
                   selected={key === selectedKey}
                   readOnly={!source || !isBacklogSourceWritable(source)}
                   onOpen={onOpen}
@@ -165,6 +170,8 @@ function BacklogColumnView({
   renderCard: (item: BoardIssue) => ReactNode;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: column.status });
+  const [limit, setLimit] = useState<number>(CLOSED_COLUMN_PAGE.initial);
+  const { visible, hidden } = pageBacklogColumn(column, limit);
   return (
     <section
       ref={setNodeRef}
@@ -179,7 +186,16 @@ function BacklogColumnView({
         <span className="tabular-nums">{column.issues.length}</span>
       </header>
       <div className="flex min-h-16 flex-1 flex-col gap-2 overflow-y-auto px-2 pb-2">
-        {column.issues.map(renderCard)}
+        {visible.map(renderCard)}
+        {hidden > 0 ? (
+          <Button
+            size="sm"
+            variant="ghost-muted"
+            onClick={() => setLimit((current) => current + CLOSED_COLUMN_PAGE.step)}
+          >
+            Show {Math.min(hidden, CLOSED_COLUMN_PAGE.step)} more
+          </Button>
+        ) : null}
       </div>
     </section>
   );

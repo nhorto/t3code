@@ -60,6 +60,7 @@ export type T3McpToolSummaryAction =
   | "backlog-read"
   | "backlog-write"
   | "backlog-claim"
+  | "agent-message"
   | "browser"
   | "device";
 
@@ -312,6 +313,7 @@ const T3_MCP_TOOLS: Readonly<Record<string, T3McpToolDefinition>> = {
     "backlog-claim",
   ),
   backlog_release: tool(["Release", "Releasing", "Released", "a backlog issue"], "backlog-claim"),
+  agent_message: tool(["Message", "Messaging", "Messaged", "another agent"], "agent-message"),
 };
 
 /**

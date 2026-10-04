@@ -11,11 +11,17 @@ import {
   isBacklogStatusClosed,
   parseBacklogIssueKey,
   type BacklogActivityKind,
+  type BacklogClaimResult,
+  type BacklogChildInput as ContractBacklogChildInput,
+  type BacklogClaimInput as ContractBacklogClaimInput,
+  type BacklogClaimNextInput as ContractBacklogClaimNextInput,
   type BacklogCommentInput,
+  type BacklogCreateChildrenInput as ContractBacklogCreateChildrenInput,
+  type BacklogListIssuesInput,
+  type BacklogRenewClaimsInput as ContractBacklogRenewClaimsInput,
+  type BacklogRepositoryTarget,
   type BacklogCreateIssueInput,
   type BacklogGetIssueInput,
-  type EnvironmentId,
-  type BacklogId,
   type BacklogIssueDetail,
   type BacklogIssueId,
   type BacklogIssuePriority,
@@ -25,6 +31,7 @@ import {
   type BacklogStreamEvent,
   type BacklogUpdateBacklogInput,
   type BacklogUpdateIssueInput,
+  type OrchestrationV2ThreadShell,
   type ProjectId,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -48,6 +55,33 @@ import { forkParked } from "../serverActivation.ts";
 /** How often the lease keeper renews live holders' claims and expires the rest. */
 export const LEASE_KEEPER_INTERVAL = "1 minute";
 
+/**
+ * How long a thread keeps its claims after its last turn ends. An agent that
+ * stops to ask the user a question must not lose its issue 15 minutes later.
+ */
+export const CLAIM_IDLE_GRACE_MS = 2 * 60 * 60_000;
+
+/**
+ * Whether a thread still holds its claims: it exists, is not archived or
+ * deleted, and is running or was active within the idle grace. The hub link's
+ * renewal uses the same rule for this machine's claims on a hub.
+ */
+export function isThreadHoldingClaims(
+  shell: Pick<
+    OrchestrationV2ThreadShell,
+    "activeRunId" | "archivedAt" | "deletedAt" | "latestRunCompletedAt" | "updatedAt"
+  >,
+  nowMs: number,
+): boolean {
+  if (shell.deletedAt !== null || shell.archivedAt !== null) return false;
+  if (shell.activeRunId !== null) return true;
+  const lastActiveMs = Math.max(
+    shell.updatedAt.epochMilliseconds,
+    shell.latestRunCompletedAt?.epochMilliseconds ?? 0,
+  );
+  return nowMs - lastActiveMs <= CLAIM_IDLE_GRACE_MS;
+}
+
 const INBOX_KEY = "INBOX";
 const LEASE_KEEPER_ACTOR: BacklogActor = {
   kind: "system",
@@ -56,42 +90,13 @@ const LEASE_KEEPER_ACTOR: BacklogActor = {
   label: "Lease keeper",
 };
 
-export interface BacklogIssueFilters {
-  readonly backlogId?: BacklogId | undefined;
-  readonly status?: ReadonlyArray<BacklogIssueStatus> | undefined;
-  readonly type?: BacklogIssueType | undefined;
-  readonly parentId?: BacklogIssueId | undefined;
-  /** Only ready, unblocked, unclaimed issues. */
-  readonly frontierOnly?: boolean | undefined;
-}
-
-export interface BacklogChildInput {
-  readonly title: string;
-  readonly body?: string | undefined;
-  readonly type?: BacklogIssueType | undefined;
-  readonly priority?: BacklogIssuePriority | null | undefined;
-  readonly status?: BacklogIssueStatus | undefined;
-  /** Zero-based indexes of sibling children in the same batch that block this one. */
-  readonly blockedBySiblings?: ReadonlyArray<number> | undefined;
-  /** Existing issues that block this one. */
-  readonly blockedBy?: ReadonlyArray<BacklogIssueId> | undefined;
-}
-
-export interface BacklogCreateChildrenInput {
-  readonly parentId: BacklogIssueId;
-  readonly children: ReadonlyArray<BacklogChildInput>;
-}
-
-export interface BacklogClaimInput {
-  readonly issueId: BacklogIssueId;
-}
-
-export type BacklogClaimNextInput = Pick<BacklogIssueFilters, "backlogId" | "parentId" | "type">;
-
-export interface BacklogRenewClaimsInput {
-  readonly environmentId: EnvironmentId | null;
-  readonly threadIds: ReadonlyArray<ThreadId>;
-}
+// The inputs live in contracts because a linked server sends them over the wire.
+export type BacklogIssueFilters = BacklogListIssuesInput;
+export type BacklogChildInput = ContractBacklogChildInput;
+export type BacklogCreateChildrenInput = ContractBacklogCreateChildrenInput;
+export type BacklogClaimInput = ContractBacklogClaimInput;
+export type BacklogClaimNextInput = ContractBacklogClaimNextInput;
+export type BacklogRenewClaimsInput = ContractBacklogRenewClaimsInput;
 
 export interface BacklogAddLinkInput {
   readonly issueId: BacklogIssueId;
@@ -106,6 +111,13 @@ export class BacklogService extends Context.Service<
     readonly resolveBacklogRef: (ref: string) => Effect.Effect<Backlog, BacklogError>;
     /** The project's backlog, created from the project title on first use. */
     readonly ensureProjectBacklog: (projectId: ProjectId) => Effect.Effect<Backlog, BacklogError>;
+    /**
+     * The repository's backlog: a project's backlog for it when one exists here,
+     * else one keyed by the repository alone, created on first use.
+     */
+    readonly ensureRepositoryBacklog: (
+      target: BacklogRepositoryTarget,
+    ) => Effect.Effect<Backlog, BacklogError>;
     readonly updateBacklog: (
       input: BacklogUpdateBacklogInput,
       actor: BacklogActor,
@@ -144,12 +156,12 @@ export class BacklogService extends Context.Service<
     readonly claim: (
       input: BacklogClaimInput,
       actor: BacklogActor,
-    ) => Effect.Effect<BacklogIssueDetail, BacklogError>;
+    ) => Effect.Effect<BacklogClaimResult, BacklogError>;
     /** Claims the best frontier issue matching the filters, or returns null when none is free. */
     readonly claimNext: (
       input: BacklogClaimNextInput,
       actor: BacklogActor,
-    ) => Effect.Effect<BacklogIssueDetail | null, BacklogError>;
+    ) => Effect.Effect<BacklogClaimResult | null, BacklogError>;
     /**
      * The holder (same environment and thread) releases its claim. A user
      * releases anyone's claim: that is the client's force-release.
@@ -519,14 +531,20 @@ export const layer = Layer.effect(
       if (changed.length > 0) yield* PubSub.publishAll(events, changed);
     });
 
+    /**
+     * The body may be interrupted (its transaction then rolls back), but once
+     * it commits the publish always runs, so subscribers never miss a change.
+     */
     const mutate = <A, E, R>(body: (touched: Touched) => Effect.Effect<A, E, R>) =>
       writeLock.withPermits(1)(
-        Effect.gen(function* () {
-          const touched: Touched = { issues: new Set(), backlogs: new Set() };
-          const result = yield* sql.withTransaction(body(touched));
-          yield* publishTouched(touched);
-          return result;
-        }),
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const touched: Touched = { issues: new Set(), backlogs: new Set() };
+            const result = yield* sql.withTransaction(restore(body(touched)));
+            yield* publishTouched(touched);
+            return result;
+          }),
+        ),
       );
 
     const recordActivity = Effect.fn("BacklogService.recordActivity")(function* (input: {
@@ -565,17 +583,57 @@ export const layer = Layer.effect(
         ),
       );
 
-    /** A parent must exist in the same backlog and must not descend from the child. */
+    /** The issue and every issue above it, nearest first. */
+    const selfAndAncestors = (issueId: string) =>
+      sql<{ id: string }>`
+        WITH RECURSIVE ancestors(id, depth) AS (
+          SELECT ${issueId}, 0
+          UNION
+          SELECT i.parent_id, a.depth + 1 FROM backlog_issues i JOIN ancestors a ON i.id = a.id
+          WHERE i.parent_id IS NOT NULL
+        )
+        SELECT id FROM ancestors ORDER BY depth
+      `.pipe(Effect.map((rows) => rows.map((row) => row.id)));
+
+    /**
+     * A parent cannot close while a child is open, so a child blocked by its
+     * parent (or any ancestor) could never be worked.
+     */
+    const assertNoAncestorBlocks = Effect.fn("BacklogService.assertNoAncestorBlocks")(function* (
+      blockerIds: ReadonlyArray<string>,
+      parentId: string | null,
+    ) {
+      if (parentId === null || blockerIds.length === 0) return;
+      const ancestors = new Set(yield* selfAndAncestors(parentId));
+      if (blockerIds.some((id) => ancestors.has(id))) {
+        return yield* invalid(
+          "An issue cannot be blocked by its parent or an ancestor: the parent cannot close until its children do.",
+        );
+      }
+    });
+
+    /**
+     * A parent must exist in the same backlog, must not descend from the child,
+     * and must be open when the child is: an open child under a closed parent
+     * would break "a parent closes only after its children".
+     */
     const validateParent = Effect.fn("BacklogService.validateParent")(function* (
       issueId: string | null,
       parentId: BacklogIssueId,
       backlogId: string,
+      childStatus: BacklogIssueStatus,
     ) {
       if (parentId === issueId) return yield* invalid("An issue cannot be its own parent.");
       const parent = yield* findIssue(parentId);
       if (parent === null) return yield* notFound("Parent issue not found.", parentId);
       if (parent.backlogId !== backlogId) {
         return yield* invalid("A parent and its children must be in the same backlog.", parentId);
+      }
+      if (isBacklogStatusClosed(parent.status) && !isBacklogStatusClosed(childStatus)) {
+        return yield* conflict(
+          `${parent.key} is ${parent.status}. Reopen it before adding or reopening a child.`,
+          parentId,
+        );
       }
       if (issueId === null) return;
       const cycle = yield* sql`
@@ -589,13 +647,18 @@ export const layer = Layer.effect(
       if (cycle.length > 0) return yield* invalid("That parent would create a cycle.", parentId);
     });
 
-    /** Replaces an issue's blockers after checking they exist and close no cycle. */
+    /**
+     * Replaces an issue's blockers after checking they exist, close no cycle,
+     * and include no ancestor of the issue (given its effective parent).
+     */
     const replaceBlockers = Effect.fn("BacklogService.replaceBlockers")(function* (
       issueId: string,
       blockerIds: ReadonlyArray<string>,
+      parentId: string | null,
     ) {
       const unique = [...new Set(blockerIds)];
       if (unique.includes(issueId)) return yield* invalid("An issue cannot block itself.");
+      yield* assertNoAncestorBlocks(unique, parentId);
       yield* sql`DELETE FROM backlog_issue_blockers WHERE issue_id = ${issueId}`;
       if (unique.length === 0) return;
       const existing = yield* sql<{ id: string }>`
@@ -634,8 +697,8 @@ export const layer = Layer.effect(
       touched: Touched,
     ) {
       const id = yield* newId;
-      if (input.parentId) yield* validateParent(null, input.parentId, backlog.id);
       const status = input.status ?? (backlog.kind === "inbox" ? "inbox" : "backlog");
+      if (input.parentId) yield* validateParent(null, input.parentId, backlog.id, status);
       const number = yield* takeNumber(backlog.id);
       yield* sql`INSERT INTO backlog_issues ${sql.insert({
         id,
@@ -764,7 +827,7 @@ export const layer = Layer.effect(
         if (issue.claim !== null && isHolder(issue.claim.actor, actor)) {
           // A retried claim by the holder renews instead of failing.
           yield* renewLeases(actor.environmentId, [actor.threadId!], current);
-          return;
+          return { alreadyHeld: true };
         }
         if (issue.claim !== null) {
           return yield* conflict(
@@ -800,6 +863,7 @@ export const layer = Layer.effect(
           touched,
         );
       }
+      return { alreadyHeld: false };
     });
 
     // Inbox: one per environment, created on first start.
@@ -835,25 +899,25 @@ export const layer = Layer.effect(
         return backlog;
       }).pipe(backlogErrorsOnly);
 
-    const ensureProjectBacklog: BacklogService["Service"]["ensureProjectBacklog"] = (projectId) =>
+    /** Creates a project backlog unless one already exists for the project or its repository. */
+    const insertProjectBacklog = (input: {
+      readonly projectId: ProjectId | null;
+      readonly repositoryKey: string | null;
+      readonly title: string;
+    }) =>
       Effect.gen(function* () {
-        const existing = yield* selectBacklogs(sql`project_id = ${projectId}`);
-        if (existing[0] !== undefined) return existing[0];
-        // Read the project before the transaction: the project service has its
-        // own storage and must not run inside this one.
-        const project = yield* projects.getShell(projectId);
-        if (Option.isNone(project)) return yield* notFound("Project not found.");
-        const repositoryKey = project.value.repositoryIdentity?.canonicalKey ?? null;
-        const base = deriveBacklogKey(project.value.title);
+        const { projectId, repositoryKey } = input;
+        const base = deriveBacklogKey(input.title);
         const id = yield* newId;
         return yield* mutate((touched) =>
           Effect.gen(function* () {
             // One board per repository: a second project for the same
             // repository shares the first one's backlog.
             const raced = yield* selectBacklogs(
-              repositoryKey === null
-                ? sql`project_id = ${projectId}`
-                : sql`project_id = ${projectId} OR repository_key = ${repositoryKey}`,
+              sql.or([
+                ...(projectId === null ? [] : [sql`project_id = ${projectId}`]),
+                ...(repositoryKey === null ? [] : [sql`repository_key = ${repositoryKey}`]),
+              ]),
             );
             if (raced[0] !== undefined) return raced[0];
             const taken = new Set(
@@ -869,7 +933,7 @@ export const layer = Layer.effect(
               id,
               kind: "project",
               key,
-              title: project.value.title,
+              title: input.title,
               project_id: projectId,
               repository_key: repositoryKey,
               next_number: 1,
@@ -880,6 +944,40 @@ export const layer = Layer.effect(
             return yield* loadBacklog(id);
           }),
         );
+      });
+
+    const ensureProjectBacklog: BacklogService["Service"]["ensureProjectBacklog"] = (projectId) =>
+      Effect.gen(function* () {
+        const existing = yield* selectBacklogs(sql`project_id = ${projectId}`);
+        if (existing[0] !== undefined) return existing[0];
+        // Read the project before the transaction: the project service has its
+        // own storage and must not run inside this one.
+        const project = yield* projects.getShell(projectId);
+        if (Option.isNone(project)) return yield* notFound("Project not found.");
+        return yield* insertProjectBacklog({
+          projectId,
+          repositoryKey: project.value.repositoryIdentity?.canonicalKey ?? null,
+          title: project.value.title,
+        });
+      }).pipe(backlogErrorsOnly);
+
+    const ensureRepositoryBacklog: BacklogService["Service"]["ensureRepositoryBacklog"] = (
+      target,
+    ) =>
+      Effect.gen(function* () {
+        const existing = yield* selectBacklogs(sql`repository_key = ${target.key}`);
+        if (existing[0] !== undefined) return existing[0];
+        // Prefer a local project for the repository so its board is the
+        // project's own; otherwise the backlog stands for the repository alone.
+        const project = (yield* projects.listShells()).find(
+          (shell) => shell.repositoryIdentity?.canonicalKey === target.key,
+        );
+        if (project !== undefined) return yield* ensureProjectBacklog(project.id);
+        return yield* insertProjectBacklog({
+          projectId: null,
+          repositoryKey: target.key,
+          title: target.title,
+        });
       }).pipe(backlogErrorsOnly);
 
     const updateBacklog: BacklogService["Service"]["updateBacklog"] = (input, _actor) =>
@@ -947,7 +1045,17 @@ export const layer = Layer.effect(
                 UNION ALL
                 SELECT id FROM backlog_issues WHERE id = ${ref.trim()}
               `;
-        if (rows[0] === undefined) return yield* notFound(`Issue ${ref.trim()} not found.`);
+        if (rows[0] === undefined) {
+          // Keys can be renamed, so a remembered key may no longer exist.
+          const keyExists =
+            parsed !== null &&
+            (yield* sql`SELECT 1 FROM backlogs WHERE key = ${parsed.backlogKey}`).length > 0;
+          return yield* notFound(
+            parsed !== null && !keyExists
+              ? `No backlog has the key ${parsed.backlogKey}; keys can be renamed, so list the backlogs for the current ones.`
+              : `Issue ${ref.trim()} not found.`,
+          );
+        }
         return rows[0].id as BacklogIssueId;
       }).pipe(backlogErrorsOnly);
 
@@ -958,12 +1066,16 @@ export const layer = Layer.effect(
             ? yield* loadBacklog(input.backlogId)
             : input.projectId !== undefined
               ? yield* ensureProjectBacklog(input.projectId)
-              : yield* inbox;
+              : input.repository !== undefined
+                ? yield* ensureRepositoryBacklog(input.repository)
+                : yield* inbox;
         const id = yield* mutate((touched) =>
           Effect.gen(function* () {
             const at = DateTime.formatIso(yield* now);
             const id = yield* insertIssue(backlog, input, actor, at, touched);
-            if (input.blockedBy !== undefined) yield* replaceBlockers(id, input.blockedBy);
+            if (input.blockedBy !== undefined) {
+              yield* replaceBlockers(id, input.blockedBy, input.parentId ?? null);
+            }
             return id;
           }),
         );
@@ -998,7 +1110,7 @@ export const layer = Layer.effect(
                 siblings.push(siblingId);
               }
               const blockers = [...siblings, ...(child.blockedBy ?? [])];
-              if (blockers.length > 0) yield* replaceBlockers(ids[index]!, blockers);
+              if (blockers.length > 0) yield* replaceBlockers(ids[index]!, blockers, parentId);
             }
             return ids;
           }),
@@ -1014,9 +1126,11 @@ export const layer = Layer.effect(
         // update's own transaction; backlogId wins when both are given.
         const targetId =
           input.backlogId ??
-          (input.projectId === undefined
-            ? undefined
-            : (yield* ensureProjectBacklog(input.projectId)).id);
+          (input.projectId !== undefined
+            ? (yield* ensureProjectBacklog(input.projectId)).id
+            : input.repository !== undefined
+              ? (yield* ensureRepositoryBacklog(input.repository)).id
+              : undefined);
         const id = yield* mutate((touched) =>
           Effect.gen(function* () {
             const issue = yield* loadIssue(input.issueId);
@@ -1054,8 +1168,13 @@ export const layer = Layer.effect(
                 );
               }
             }
-            if (parentId !== issue.parentId || (target !== null && parentId !== null)) {
-              if (parentId !== null) yield* validateParent(issue.id, parentId, backlogId);
+            const parentChanged = parentId !== issue.parentId;
+            // Reopening a child also re-checks its parent: it must be open too.
+            if (parentId !== null && (parentChanged || target !== null || statusChanged)) {
+              yield* validateParent(issue.id, parentId, backlogId, status);
+            }
+            if (parentChanged && input.blockedBy === undefined) {
+              yield* assertNoAncestorBlocks(issue.blockedBy, parentId);
             }
             if (statusChanged) yield* assertParentMayClose(issue, status);
 
@@ -1076,7 +1195,7 @@ export const layer = Layer.effect(
                 issue.blockedBy.some((b) => !next.has(b))
               ) {
                 edited.push("blockers");
-                yield* replaceBlockers(issue.id, input.blockedBy);
+                yield* replaceBlockers(issue.id, input.blockedBy, parentId);
               }
             }
             if (edited.length === 0 && !statusChanged && target === null) return issue.id;
@@ -1115,8 +1234,9 @@ export const layer = Layer.effect(
               });
             }
             if (statusChanged) {
-              // Changing the column ends the claim: a user overrides it, and the
-              // holder moving its own issue is done holding it.
+              // Changing the column ends the claim: a user overrides it (the
+              // client confirms first), and the holder moving its own issue is
+              // done holding it. Either way the history says whose claim ended.
               if (issue.claim !== null) {
                 yield* clearClaim(issue.id);
                 yield* recordActivity({
@@ -1124,7 +1244,7 @@ export const layer = Layer.effect(
                   kind: "released",
                   actor,
                   at,
-                  text: `Released the claim held by ${issue.claim.actor.label}`,
+                  text: `Released ${issue.claim.actor.label}'s claim`,
                 });
               }
               yield* setStatus(issue, status, at);
@@ -1168,10 +1288,12 @@ export const layer = Layer.effect(
       }).pipe(backlogErrorsOnly);
 
     const claim: BacklogService["Service"]["claim"] = ({ issueId }, actor) =>
-      mutate((touched) => claimInTransaction(issueId, actor, touched)).pipe(
-        Effect.andThen(getIssue({ issueId })),
-        backlogErrorsOnly,
-      );
+      Effect.gen(function* () {
+        const { alreadyHeld } = yield* mutate((touched) =>
+          claimInTransaction(issueId, actor, touched),
+        );
+        return { ...(yield* getIssue({ issueId })), alreadyHeld };
+      }).pipe(backlogErrorsOnly);
 
     const claimNext: BacklogService["Service"]["claimNext"] = (filters, actor) =>
       Effect.gen(function* () {
@@ -1186,7 +1308,9 @@ export const layer = Layer.effect(
             return next.id;
           }),
         );
-        return claimed === null ? null : yield* getIssue({ issueId: claimed });
+        return claimed === null
+          ? null
+          : { ...(yield* getIssue({ issueId: claimed })), alreadyHeld: false };
       }).pipe(backlogErrorsOnly);
 
     const release: BacklogService["Service"]["release"] = (input, actor) =>
@@ -1283,43 +1407,37 @@ export const layer = Layer.effect(
       );
 
     /**
-     * Renews leases whose holder thread is running on this environment and
-     * expires the rest once their deadline passes. Holders on other
-     * environments keep their lease only by calling backlog tools, which renew.
+     * Renews leases whose holder thread on this environment still holds its
+     * claims (see isThreadHoldingClaims) and expires the rest once their
+     * deadline passes. Holders on other environments are renewed by their own
+     * server over the hub link, or whenever they call a backlog tool.
      */
     const keepLeases = Effect.gen(function* () {
       const claimed = yield* sql<{ claim_thread_id: string | null }>`
         SELECT DISTINCT claim_thread_id FROM backlog_issues WHERE claim_actor_json IS NOT NULL
       `;
+      const nowMs = (yield* now).epochMilliseconds;
       const live: string[] = [];
       for (const { claim_thread_id: threadId } of claimed) {
         if (threadId === null) continue;
         const shell = yield* threads
           .getThreadShell(threadId as ThreadId)
           .pipe(Effect.orElseSucceed(() => null));
-        if (
-          shell !== null &&
-          shell.deletedAt === null &&
-          shell.archivedAt === null &&
-          shell.activeRunId !== null
-        ) {
-          live.push(threadId);
-        }
+        if (shell !== null && isThreadHoldingClaims(shell, nowMs)) live.push(threadId);
       }
       yield* mutate((touched) =>
         Effect.gen(function* () {
           const current = yield* now;
           const at = DateTime.formatIso(current);
+          // Not published: a renewed deadline every minute is not a visible change.
           if (live.length > 0) {
-            const renewed = yield* sql<{ id: string }>`
+            yield* sql`
               UPDATE backlog_issues
               SET lease_expires_at = ${DateTime.formatIso(
                 DateTime.add(current, { milliseconds: BACKLOG_CLAIM_LEASE_MS }),
               )}
               WHERE claim_actor_json IS NOT NULL AND ${sql.in("claim_thread_id", live)}
-              RETURNING id
             `;
-            for (const row of renewed) touched.issues.add(row.id);
           }
           const expired = yield* sql<{ id: string; status: string }>`
             SELECT id, status FROM backlog_issues
@@ -1363,6 +1481,7 @@ export const layer = Layer.effect(
       listBacklogs,
       resolveBacklogRef,
       ensureProjectBacklog,
+      ensureRepositoryBacklog,
       updateBacklog,
       listIssues,
       getIssue,

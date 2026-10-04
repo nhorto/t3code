@@ -3,6 +3,7 @@ import type {
   BacklogIssue,
   BacklogIssueId,
   BacklogIssuePriority,
+  BacklogIssueStatus,
   BacklogIssueType,
   EnvironmentId,
 } from "@t3tools/contracts";
@@ -18,6 +19,7 @@ import { memo, type KeyboardEvent } from "react";
 
 import { cn } from "../../lib/utils";
 import { Badge } from "../ui/badge";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { BACKLOG_PRIORITY_LABELS, BACKLOG_TYPE_LABELS, boardIssueKey } from "./backlog.logic";
 
 export const BACKLOG_TYPE_ICONS: Record<BacklogIssueType, LucideIcon> = {
@@ -47,6 +49,8 @@ export function BacklogTypeIcon({ type }: { type: BacklogIssueType }) {
 export interface BacklogDragData {
   readonly environmentId: EnvironmentId;
   readonly issue: BacklogIssue;
+  /** The column the card is drawn in: a pending move's status before the server answers. */
+  readonly status: BacklogIssueStatus;
 }
 
 export interface BacklogCardProps {
@@ -60,6 +64,8 @@ export interface BacklogCardProps {
   readonly childTotal: number;
   /** "agent label · machine" for a claimed issue. */
   readonly claimLabel: string | null;
+  /** The column the card is drawn in. */
+  readonly status: BacklogIssueStatus;
   readonly selected: boolean;
   readonly readOnly: boolean;
   readonly onOpen: (environmentId: EnvironmentId, issueId: BacklogIssueId) => void;
@@ -95,10 +101,17 @@ export function BacklogCardContent({
             </Badge>
           ) : null}
           {claimLabel ? (
-            <Badge size="sm" variant="info" aria-label={`Claimed by ${claimLabel}`}>
-              <BotIcon aria-hidden />
-              <span className="truncate">{claimLabel}</span>
-            </Badge>
+            <Tooltip>
+              <TooltipTrigger
+                render={<Badge size="sm" variant="info" aria-label={`Claimed by ${claimLabel}`} />}
+              >
+                <BotIcon aria-hidden />
+                <span className="truncate">{claimLabel}</span>
+              </TooltipTrigger>
+              <TooltipPopup>
+                Held by {claimLabel}. Release it to Ready from the issue to move it.
+              </TooltipPopup>
+            </Tooltip>
           ) : null}
           {childTotal > 0 ? (
             <Badge
@@ -119,7 +132,7 @@ const CARD_CLASS =
   "flex w-full min-w-0 flex-col gap-1.5 rounded-lg border bg-card p-2.5 text-left text-card-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring";
 
 export function BacklogCardOverlay(
-  props: Omit<BacklogCardProps, "selected" | "readOnly" | "onOpen">,
+  props: Omit<BacklogCardProps, "status" | "selected" | "readOnly" | "onOpen">,
 ) {
   return (
     <div className={cn(CARD_CLASS, "cursor-grabbing shadow-lg")}>
@@ -129,16 +142,19 @@ export function BacklogCardOverlay(
 }
 
 export const BacklogCard = memo(function BacklogCard({
+  status,
   selected,
   readOnly,
   onOpen,
   ...content
 }: BacklogCardProps) {
-  const { issue, environmentId } = content;
+  const { issue, environmentId, claimLabel } = content;
+  // A claimed card belongs to its agent; Release to Ready in the issue is the way to take it back.
+  const held = claimLabel !== null;
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id: boardIssueKey(environmentId, issue.id),
-    data: { environmentId, issue } satisfies BacklogDragData,
-    disabled: readOnly,
+    data: { environmentId, issue, status } satisfies BacklogDragData,
+    disabled: readOnly || held,
   });
   const open = () => onOpen(environmentId, issue.id);
   return (
@@ -157,12 +173,16 @@ export const BacklogCard = memo(function BacklogCard({
       }}
       onClick={open}
       aria-pressed={selected}
-      aria-label={`${issue.key}: ${issue.title}`}
+      aria-label={
+        held
+          ? `${issue.key}: ${issue.title}. Held by ${claimLabel}; release it to Ready to move it`
+          : `${issue.key}: ${issue.title}`
+      }
       className={cn(
         CARD_CLASS,
         // Offscreen cards skip style, layout and paint, so a long column costs what is visible.
         "[contain-intrinsic-size:auto_76px] [content-visibility:auto]",
-        readOnly ? "cursor-pointer" : "cursor-grab",
+        readOnly || held ? "cursor-pointer" : "cursor-grab",
         selected ? "border-ring bg-accent" : "hover:bg-accent/50",
         isDragging && "opacity-40",
       )}

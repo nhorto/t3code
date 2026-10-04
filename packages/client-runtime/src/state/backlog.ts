@@ -10,9 +10,11 @@ import {
   type BacklogStreamEvent,
   type EnvironmentId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
+import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
-import { AsyncResult, Atom } from "effect/unstable/reactivity";
+import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import {
@@ -97,8 +99,35 @@ export function groupBacklogIssuesByStatus(
   return groups;
 }
 
+/**
+ * The question to ask before a client changes a claimed issue's status, or null when nobody holds
+ * it. Force-releasing is the explicit override and does not ask.
+ */
+export function claimTakeoverMessage(issue: Pick<BacklogIssue, "key" | "claim">): string | null {
+  if (issue.claim === null) return null;
+  const holder = issue.claim.actor.label.trim() || "the agent holding it";
+  return `This takes ${issue.key} away from ${holder}. Continue?`;
+}
+
 export function isIssueBlockedOnBoard(state: BacklogBoardState, issue: BacklogIssue): boolean {
   return isBacklogIssueBlocked(issue, state.issuesById);
+}
+
+const UNKNOWN_BACKLOG_RPC = /Unknown request tag: backlog\./;
+
+/**
+ * Whether a backlog RPC failed because the server predates Backlog. Effect's RpcServer answers an
+ * unknown tag with a defect, "Unknown request tag: backlog.subscribe", so an older or upstream
+ * server reads as unsupported rather than broken.
+ */
+export function isBacklogUnsupportedCause(cause: Cause.Cause<unknown>): boolean {
+  return cause.reasons.some((reason) => {
+    if (!Cause.isDieReason(reason)) return false;
+    const defect = reason.defect;
+    const message =
+      typeof defect === "string" ? defect : defect instanceof Error ? defect.message : null;
+    return message !== null && UNKNOWN_BACKLOG_RPC.test(message);
+  });
 }
 
 export function createBacklogEnvironmentAtoms<R, E>(
@@ -139,9 +168,35 @@ export function createBacklogEnvironmentAtoms<R, E>(
       issueVersion(JSON.stringify([environmentId, input.issueId])),
   });
 
+  /** The environment's backlog hub link, probed on read so the state is current. */
+  const hubLink = createEnvironmentRpcQueryAtomFamily(runtime, {
+    label: "environment-data:backlog:hub-link",
+    tag: WS_METHODS.backlogGetHubLink,
+    staleTimeMs: 0,
+  });
+  const refreshHubLink = (
+    { environmentId }: { readonly environmentId: EnvironmentId },
+    registry: AtomRegistry.AtomRegistry,
+  ) => Effect.sync(() => registry.refresh(hubLink({ environmentId, input: {} })));
+
   return {
     board,
     issueDetail,
+    hubLink,
+    linkHub: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:backlog:link-hub",
+      tag: WS_METHODS.backlogLinkHub,
+      scheduler,
+      concurrency: serialPerEnvironment,
+      onSuccess: refreshHubLink,
+    }),
+    unlinkHub: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:backlog:unlink-hub",
+      tag: WS_METHODS.backlogUnlinkHub,
+      scheduler,
+      concurrency: serialPerEnvironment,
+      onSuccess: refreshHubLink,
+    }),
     createIssue: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:backlog:create-issue",
       tag: WS_METHODS.backlogCreateIssue,

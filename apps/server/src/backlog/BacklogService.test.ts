@@ -9,6 +9,7 @@ import {
   type OrchestrationProjectShell,
   type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -42,6 +43,8 @@ const projects: Record<string, { title: string; canonicalKey?: string }> = {
 
 /** Threads whose run is still active, so the lease keeper renews their claims. */
 const runningThreads = new Set<string>([agent("live").threadId!]);
+/** Threads with no run, each with when it was last active (the test clock starts at 0). */
+const idleThreads = new Map<string, number>([[agent("asking").threadId!, 0]]);
 
 const testLayer = layer.pipe(
   Layer.provide(
@@ -67,10 +70,12 @@ const testLayer = layer.pipe(
       Layer.mock(ThreadManagementService.ThreadManagementService)({
         getThreadShell: (threadId) =>
           Effect.succeed(
-            runningThreads.has(threadId)
+            runningThreads.has(threadId) || idleThreads.has(threadId)
               ? ({
                   id: threadId,
-                  activeRunId: "run-1",
+                  activeRunId: runningThreads.has(threadId) ? "run-1" : null,
+                  updatedAt: DateTime.makeUnsafe(idleThreads.get(threadId) ?? 0),
+                  latestRunCompletedAt: null,
                   archivedAt: null,
                   deletedAt: null,
                 } as unknown as OrchestrationV2ThreadShell)
@@ -273,11 +278,62 @@ it.effect("rejects self-blocks, blocker cycles, and parent cycles", () =>
       assert.equal(cycle.code, "invalid");
       assert.deepEqual((yield* backlog.getIssue({ issueId: a.id })).issue.blockedBy, []);
 
-      yield* backlog.updateIssue({ issueId: b.id, parentId: a.id }, user);
+      yield* backlog.updateIssue({ issueId: c.id, parentId: a.id }, user);
       const parentCycle = yield* backlog
-        .updateIssue({ issueId: a.id, parentId: b.id }, user)
+        .updateIssue({ issueId: a.id, parentId: c.id }, user)
         .pipe(Effect.flip);
       assert.equal(parentCycle.code, "invalid");
+    }),
+  ),
+);
+
+it.effect("never lets a child wait on its own ancestor, or stay open under a closed parent", () =>
+  run(
+    Effect.gen(function* () {
+      const backlog = yield* BacklogService;
+      const spec = yield* backlog.createIssue({ title: "Spec" }, user);
+      const slice = yield* backlog.createIssue({ title: "Slice", parentId: spec.id }, user);
+      const step = yield* backlog.createIssue({ title: "Step", parentId: slice.id }, user);
+
+      // Blocked by a parent or grandparent, a child could never be worked.
+      for (const blocker of [slice.id, spec.id]) {
+        const error = yield* backlog
+          .updateIssue({ issueId: step.id, blockedBy: [blocker] }, user)
+          .pipe(Effect.flip);
+        assert.equal(error.code, "invalid");
+      }
+      const blockedAtBirth = yield* backlog
+        .createIssue({ title: "Late", parentId: spec.id, blockedBy: [spec.id] }, user)
+        .pipe(Effect.flip);
+      assert.equal(blockedAtBirth.code, "invalid");
+      // Attaching under an issue that already blocks it is the same deadlock.
+      const loose = yield* backlog.createIssue({ title: "Loose", blockedBy: [spec.id] }, user);
+      const attach = yield* backlog
+        .updateIssue({ issueId: loose.id, parentId: spec.id }, user)
+        .pipe(Effect.flip);
+      assert.equal(attach.code, "invalid");
+
+      yield* backlog.updateIssue({ issueId: step.id, status: "done" }, user);
+      yield* backlog.updateIssue({ issueId: slice.id, status: "done" }, user);
+      yield* backlog.updateIssue({ issueId: spec.id, status: "done" }, user);
+
+      const openChild = yield* backlog
+        .createIssue({ title: "Afterthought", parentId: spec.id }, user)
+        .pipe(Effect.flip);
+      assert.equal(openChild.code, "conflict");
+      const attachOpen = yield* backlog
+        .updateIssue({ issueId: loose.id, blockedBy: [], parentId: spec.id }, user)
+        .pipe(Effect.flip);
+      assert.equal(attachOpen.code, "conflict");
+      // Reopening a child does not quietly reopen its parent: reopen the parent first.
+      const reopen = yield* backlog
+        .updateIssue({ issueId: slice.id, status: "ready" }, user)
+        .pipe(Effect.flip);
+      assert.equal(reopen.code, "conflict");
+      assert.include(reopen.message, "Reopen it");
+      yield* backlog.updateIssue({ issueId: spec.id, status: "in_progress" }, user);
+      const reopened = yield* backlog.updateIssue({ issueId: slice.id, status: "ready" }, user);
+      assert.equal(reopened.status, "ready");
     }),
   ),
 );
@@ -342,41 +398,115 @@ it.effect("claims next by priority, then age, skipping blocked and claimed issue
   ),
 );
 
-it.effect("returns an issue to ready when its holder's lease expires, renewing live holders", () =>
+it.effect("expires a gone holder's claim, but keeps one whose thread runs or recently ran", () =>
   run(
     Effect.gen(function* () {
       const backlog = yield* BacklogService;
       const abandoned = yield* backlog.createIssue({ title: "Abandoned", status: "ready" }, user);
       const active = yield* backlog.createIssue({ title: "Active", status: "ready" }, user);
+      const waiting = yield* backlog.createIssue({ title: "Waiting", status: "ready" }, user);
       yield* backlog.claim({ issueId: abandoned.id }, agent("dead"));
       yield* backlog.claim({ issueId: active.id }, agent("live"));
+      // Ended its turn with a question for the user at t=0.
+      yield* backlog.claim({ issueId: waiting.id }, agent("asking"));
+
+      const subscribed = yield* Deferred.make<void>();
+      const readyAgain = (issueId: string) =>
+        backlog.subscribe().pipe(
+          Stream.tap((event) =>
+            event.type === "snapshot" ? Deferred.succeed(subscribed, undefined) : Effect.void,
+          ),
+          Stream.filter((event) => event.type !== "snapshot"),
+          Stream.takeUntil(
+            (event) =>
+              event.type === "issueUpserted" &&
+              event.issue.id === issueId &&
+              event.issue.status === "ready",
+          ),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+      const expiry = yield* readyAgain(abandoned.id);
+      yield* Deferred.await(subscribed);
+      yield* TestClock.adjust("16 minutes");
+      const deltas = yield* Fiber.join(expiry);
+      // Renewing a lease is not a visible change, so it sends no delta.
+      assert.isFalse(
+        deltas.some((event) => event.type === "issueUpserted" && event.issue.id !== abandoned.id),
+      );
+
+      const expired = yield* backlog.getIssue({ issueId: abandoned.id });
+      assert.equal(expired.issue.status, "ready");
+      assert.isNull(expired.issue.claim);
+      assert.equal(expired.activity.at(-1)?.kind, "lease_expired");
+      for (const kept of [active.id, waiting.id]) {
+        const detail = yield* backlog.getIssue({ issueId: kept });
+        assert.equal(detail.issue.status, "in_progress");
+      }
+
+      // Two hours after its last activity the waiting thread lets go too.
+      const lapsed = yield* readyAgain(waiting.id);
+      yield* TestClock.adjust("2 hours");
+      yield* Fiber.join(lapsed);
+      assert.isNull((yield* backlog.getIssue({ issueId: waiting.id })).issue.claim);
+      assert.equal((yield* backlog.getIssue({ issueId: active.id })).issue.status, "in_progress");
+    }),
+  ),
+);
+
+it.effect("keeps a claim made through a linked server until that server stops renewing it", () =>
+  run(
+    Effect.gen(function* () {
+      const backlog = yield* BacklogService;
+      const remote: BacklogActor = {
+        kind: "agent",
+        environmentId: EnvironmentId.make("environment-spoke"),
+        threadId: ThreadId.make("thread-on-the-spoke"),
+        label: "Spoke agent",
+      };
+      const issue = yield* backlog.createIssue({ title: "Remote work", status: "ready" }, user);
+      const claimed = yield* backlog.claim({ issueId: issue.id }, remote);
+      assert.isFalse(claimed.alreadyHeld);
+      assert.deepEqual(claimed.issue.links, [
+        { type: "thread", environmentId: remote.environmentId, threadId: remote.threadId! },
+      ]);
+      // The same thread id on this machine is a different holder.
+      const lookalike = yield* backlog
+        .claim({ issueId: issue.id }, { ...remote, environmentId, label: "Local twin" })
+        .pipe(Effect.flip);
+      assert.equal(lookalike.code, "conflict");
+      assert.isTrue((yield* backlog.claim({ issueId: issue.id }, remote)).alreadyHeld);
+
+      // The spoke renews every few minutes; the hub's keeper cannot see its thread.
+      for (let minute = 0; minute < 30; minute += 5) {
+        yield* backlog.renewClaims({
+          environmentId: remote.environmentId,
+          threadIds: [remote.threadId!],
+        });
+        yield* TestClock.adjust("5 minutes");
+      }
+      assert.equal((yield* backlog.getIssue({ issueId: issue.id })).issue.status, "in_progress");
 
       const subscribed = yield* Deferred.make<void>();
       const expiry = yield* backlog.subscribe().pipe(
         Stream.tap((event) =>
           event.type === "snapshot" ? Deferred.succeed(subscribed, undefined) : Effect.void,
         ),
-        Stream.filter(
-          (event) =>
-            event.type === "issueUpserted" &&
-            event.issue.id === abandoned.id &&
-            event.issue.status === "ready",
-        ),
+        Stream.filter((event) => event.type === "issueUpserted" && event.issue.status === "ready"),
         Stream.runHead,
         Effect.forkChild,
       );
       yield* Deferred.await(subscribed);
       yield* TestClock.adjust("16 minutes");
       yield* Fiber.join(expiry);
+      const lapsed = yield* backlog.getIssue({ issueId: issue.id });
+      assert.isNull(lapsed.issue.claim);
+      assert.equal(lapsed.issue.status, "ready");
 
-      const expired = yield* backlog.getIssue({ issueId: abandoned.id });
-      assert.equal(expired.issue.status, "ready");
-      assert.isNull(expired.issue.claim);
-      assert.equal(expired.activity.at(-1)?.kind, "lease_expired");
-
-      const renewed = yield* backlog.getIssue({ issueId: active.id });
-      assert.equal(renewed.issue.status, "in_progress");
-      assert.equal(renewed.issue.claim?.actor.label, "Agent live");
+      const again = yield* backlog.claim({ issueId: issue.id }, remote);
+      const released = yield* backlog.release({ issueId: issue.id, status: "review" }, remote);
+      assert.isFalse(again.alreadyHeld);
+      assert.equal(released.status, "review");
     }),
   ),
 );
@@ -417,11 +547,7 @@ it.effect("lets only the holder release, while a user can force-release or move 
       const { activity } = yield* backlog.getIssue({ issueId: issue.id });
       assert.deepEqual(
         activity.filter((entry) => entry.kind === "released").map((entry) => entry.text),
-        [
-          "PR is up.",
-          "Force-released the claim held by Agent b",
-          "Released the claim held by Agent c",
-        ],
+        ["PR is up.", "Force-released the claim held by Agent b", "Released Agent c's claim"],
       );
     }),
   ),

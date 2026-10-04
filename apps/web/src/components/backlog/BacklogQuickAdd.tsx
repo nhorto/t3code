@@ -117,9 +117,12 @@ function IssueTypeSelect({
 export function BacklogInlineQuickAdd({
   target,
   targetLabel,
+  blockedReason,
 }: {
   target: BacklogCreateTarget | null;
   targetLabel: string;
+  /** Shown in place of the prompt while there is no target. */
+  blockedReason?: string | null;
 }) {
   const create = useCreateBacklogIssue();
   const [title, setTitle] = useState("");
@@ -143,7 +146,9 @@ export function BacklogInlineQuickAdd({
         size="sm"
         className="min-w-0 flex-1"
         aria-label={`Add to ${targetLabel}`}
-        placeholder={target ? `Add to ${targetLabel}…` : `${targetLabel} is unavailable`}
+        placeholder={
+          target ? `Add to ${targetLabel}…` : (blockedReason ?? `${targetLabel} is unavailable`)
+        }
         disabled={target === null}
         value={title}
         onChange={(event) => setTitle(event.target.value)}
@@ -305,8 +310,8 @@ function BacklogQuickAddDialog({
             <IssueTypeSelect value={type} onChange={setType} />
           </div>
           {entry && !entry.createTarget ? (
-            <p className="text-destructive text-xs">
-              No machine holding this backlog is connected right now.
+            <p className="text-muted-foreground text-xs">
+              {entry.createBlockedReason ?? "No machine holding this backlog is connected."}
             </p>
           ) : null}
         </DialogPanel>

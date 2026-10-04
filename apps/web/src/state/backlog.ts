@@ -1,6 +1,7 @@
 import { useAtomValue } from "@effect/atom-react";
 import {
   createBacklogEnvironmentAtoms,
+  isBacklogUnsupportedCause,
   type BacklogBoardState,
 } from "@t3tools/client-runtime/state/backlog";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
@@ -18,6 +19,8 @@ export interface EnvironmentBacklogBoard {
   /** The last snapshot folded with its deltas; kept while the connection is down. */
   readonly board: BacklogBoardState | null;
   readonly error: string | null;
+  /** The server predates Backlog: it does not know the backlog RPCs at all. */
+  readonly unsupported: boolean;
 }
 
 /**
@@ -29,10 +32,15 @@ const boardsAtom = Atom.family((key: string) =>
     const environmentIds = JSON.parse(key) as ReadonlyArray<EnvironmentId>;
     return environmentIds.map((environmentId) => {
       const result = get(backlogEnvironment.board({ environmentId, input: {} }));
+      const unsupported = result._tag === "Failure" && isBacklogUnsupportedCause(result.cause);
       return {
         environmentId,
         board: Option.getOrNull(AsyncResult.value(result)),
-        error: result._tag === "Failure" ? formatEnvironmentQueryError(result.cause) : null,
+        error:
+          result._tag === "Failure" && !unsupported
+            ? formatEnvironmentQueryError(result.cause)
+            : null,
+        unsupported,
       };
     });
   }).pipe(Atom.withLabel(`web-backlog:boards:${key}`)),

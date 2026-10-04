@@ -2,7 +2,9 @@ import {
   AuthAccessTokenType,
   AuthAccessWriteScope,
   AuthAdministrativeScopes,
+  AuthBacklogLinkScopes,
   AuthStandardClientScopes,
+  hasAuthScope,
   type AuthAccessTokenResult,
   type AuthBrowserSessionResult,
   type AuthClientMetadata,
@@ -512,6 +514,16 @@ type BootstrapExchangeResult = {
   readonly expireNormalCookie?: boolean;
 };
 
+/**
+ * A server linked as a backlog spoke has no person to re-pair it when its
+ * session lapses, and its scopes reach nothing but the backlog, so it gets a
+ * year instead of the default 30 days. Revoke it from Connections.
+ */
+const BACKLOG_LINK_SESSION_TTL = Duration.days(365);
+const isBacklogLinkOnly = (scopes: ReadonlyArray<AuthEnvironmentScope>) =>
+  scopes.length > 0 &&
+  scopes.every((scope) => (AuthBacklogLinkScopes as ReadonlyArray<string>).includes(scope));
+
 const AUTHORIZATION_PREFIX = "Bearer ";
 const DPOP_AUTHORIZATION_PREFIX = "DPoP ";
 const WEBSOCKET_TICKET_QUERY_PARAM = "wsTicket";
@@ -807,7 +819,9 @@ export const make = Effect.gen(function* () {
         Effect.flatMap((grant) =>
           Effect.gen(function* () {
             const grantedScopes = requestedScopes ?? grant.scopes;
-            if (!grantedScopes.every((scope) => grant.scopes.includes(scope))) {
+            // A grant may be narrowed, e.g. a standard pairing link redeemed
+            // for a backlog-only link.
+            if (!grantedScopes.every((scope) => hasAuthScope(grant.scopes, scope))) {
               return yield* new ServerAuthScopeNotGrantedError({});
             }
             return yield* sessions
@@ -820,7 +834,9 @@ export const make = Effect.gen(function* () {
                       proofKeyThumbprint: input.proofKeyThumbprint,
                       ttl: Duration.hours(1),
                     }
-                  : {}),
+                  : isBacklogLinkOnly(grantedScopes)
+                    ? { ttl: BACKLOG_LINK_SESSION_TTL }
+                    : {}),
                 // Desktop restarts forget the previous bearer token. Replace
                 // its session, including stale entries left by older versions.
                 replaceActiveForSubjectAndMethod: grant.method === "desktop-bootstrap",

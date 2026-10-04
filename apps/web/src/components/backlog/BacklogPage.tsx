@@ -11,6 +11,7 @@ import {
   ChevronDownIcon,
   SquareKanbanIcon,
   ListFilterIcon,
+  MessagesSquareIcon,
   PencilIcon,
   WorkflowIcon,
 } from "lucide-react";
@@ -18,6 +19,7 @@ import { useCallback, useMemo, useState } from "react";
 
 import { isElectron } from "../../env";
 import { useEscapeToGoBack } from "../../hooks/useNavigateBack";
+import { useHeldAgentMessageCount } from "../../state/agentMessages";
 import { backlogEnvironment, backlogFailureMessage } from "../../state/backlog";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { Badge } from "../ui/badge";
@@ -58,6 +60,7 @@ import {
   hasActiveBacklogFilters,
   isBacklogSourceWritable,
   normalizeBacklogKeyInput,
+  prunePendingBacklogMoves,
   type BacklogFilters,
   type BacklogRef,
   type BacklogScope,
@@ -69,6 +72,7 @@ import {
 import { BacklogBoard } from "./BacklogBoard";
 import { BacklogGraph } from "./BacklogGraph";
 import { BacklogIssuePanel } from "./BacklogIssuePanel";
+import { BacklogMessagesPanel } from "./BacklogMessagesPanel";
 import { BacklogInlineQuickAdd } from "./BacklogQuickAdd";
 import { useBacklogSwitcher } from "./useBacklogData";
 
@@ -78,6 +82,8 @@ export interface BacklogPageSearch {
   readonly issueId?: BacklogIssueId;
   /** Board when absent. */
   readonly view?: "graph";
+  /** Shows the agent Messages feed beside the board while no issue is open. */
+  readonly messages?: true;
 }
 
 function entryLabel(entry: BacklogSwitcherEntry): string {
@@ -105,7 +111,7 @@ export function BacklogPage({
   readonly scope: BacklogScope;
 }) {
   const navigate = useNavigate();
-  const { sources, entries } = useBacklogSwitcher();
+  const { sources, unsupportedLabels, entries } = useBacklogSwitcher();
   const scopeKey = backlogScopeKey(scope);
   const entry =
     entries.find((candidate) => candidate.key === scopeKey) ??
@@ -117,6 +123,9 @@ export function BacklogPage({
   const [pendingMoves, setPendingMoves] = useState<ReadonlyMap<string, PendingBacklogMove>>(
     () => new Map(),
   );
+  // A move the stream has answered no longer holds its card; adjusted while rendering.
+  const answeredMoves = prunePendingBacklogMoves(pendingMoves, sources);
+  if (answeredMoves !== pendingMoves) setPendingMoves(answeredMoves);
 
   const selected =
     search.issueEnvironmentId && search.issueId
@@ -148,7 +157,10 @@ export function BacklogPage({
     () => updateSearch({ issueEnvironmentId: undefined, issueId: undefined }),
     [updateSearch],
   );
-  useEscapeToGoBack(selected ? closeIssue : undefined);
+  const closeMessages = useCallback(() => updateSearch({ messages: undefined }), [updateSearch]);
+  const showMessages = search.messages === true && selected === null;
+  useEscapeToGoBack(selected ? closeIssue : showMessages ? closeMessages : undefined);
+  const heldMessages = useHeldAgentMessageCount();
 
   const scopeSources = useMemo(() => sourcesForEntry(entry, sources), [entry, sources]);
   const columns = useMemo(
@@ -251,6 +263,7 @@ export function BacklogPage({
             <div className="flex flex-wrap items-center gap-2 px-5 sm:px-6">
               <BacklogInlineQuickAdd
                 target={entry.createTarget}
+                blockedReason={entry.createBlockedReason}
                 targetLabel={entry.scope.kind === "all" ? "Inbox" : entry.label}
               />
               <div className="flex items-center gap-2">
@@ -291,6 +304,26 @@ export function BacklogPage({
                     Graph
                   </Toggle>
                 </ToggleGroup>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  aria-pressed={showMessages}
+                  onClick={() =>
+                    updateSearch(
+                      showMessages
+                        ? { messages: undefined }
+                        : { messages: true, issueEnvironmentId: undefined, issueId: undefined },
+                    )
+                  }
+                >
+                  <MessagesSquareIcon aria-hidden />
+                  Messages
+                  {heldMessages > 0 ? (
+                    <Badge size="sm" variant="warning">
+                      {heldMessages} held
+                    </Badge>
+                  ) : null}
+                </Button>
               </div>
             </div>
 
@@ -312,6 +345,12 @@ export function BacklogPage({
                 ))}
               </div>
             ) : null}
+            {unsupportedLabels.length > 0 ? (
+              <p className="px-5 text-xs text-muted-foreground sm:px-6">
+                {unsupportedLabels.join(", ")} {unsupportedLabels.length > 1 ? "don't" : "doesn't"}{" "}
+                support Backlog yet.
+              </p>
+            ) : null}
 
             {noSources ? (
               <BacklogEmpty
@@ -330,7 +369,8 @@ export function BacklogPage({
                 description={
                   entry.createTarget
                     ? "Add the first idea or bug above."
-                    : "No machine that can hold this backlog is connected."
+                    : (entry.createBlockedReason ??
+                      "No machine that can hold this backlog is connected.")
                 }
               />
             ) : totalShown === 0 && hasActiveBacklogFilters(filters) ? (
@@ -362,9 +402,12 @@ export function BacklogPage({
               environmentId={selected.environmentId}
               issueId={selected.issueId}
               source={selectedSource}
+              entries={entries}
               onClose={closeIssue}
               onOpenIssue={openIssue}
             />
+          ) : showMessages ? (
+            <BacklogMessagesPanel onClose={closeMessages} />
           ) : null}
         </div>
       </div>

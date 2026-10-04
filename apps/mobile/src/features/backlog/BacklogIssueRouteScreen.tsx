@@ -1,5 +1,6 @@
 import type { MenuAction } from "@react-native-menu/menu";
 import { StackActions, useNavigation, type StaticScreenProps } from "@react-navigation/native";
+import { claimTakeoverMessage } from "@t3tools/client-runtime/state/backlog";
 import {
   BACKLOG_ISSUE_STATUSES,
   BacklogIssueId,
@@ -8,6 +9,7 @@ import {
   isBacklogStatusClosed,
   type BacklogIssue,
   type BacklogIssueLink,
+  type BacklogIssueStatus,
   type BacklogUpdateIssueInput,
 } from "@t3tools/contracts";
 import { useCallback, useMemo, useState, type ReactNode } from "react";
@@ -35,6 +37,7 @@ import {
   BACKLOG_TYPE_LABELS,
   BACKLOG_TYPES,
   backlogMoveTargets,
+  creatableProjectIdsOn,
   describeBacklogActivity,
   describeBacklogClaim,
   findBacklog,
@@ -46,6 +49,7 @@ import {
   BacklogClaimPill,
   BacklogIssueRow,
 } from "./backlog-components";
+import { useBacklogBoards } from "./useBacklogBoards";
 
 export type BacklogIssueRouteParams = {
   readonly environmentId: string;
@@ -125,8 +129,16 @@ function BacklogIssueScreen(props: {
     () => projects.filter((project) => project.environmentId === environmentId),
     [environmentId, projects],
   );
+  // Every board, so a move never creates a project backlog beside one on another environment.
+  const { scopes, environmentAvailability } = useBacklogBoards();
+  const creatableProjectIds = useMemo(
+    () => creatableProjectIdsOn(scopes, environmentAvailability, environmentId),
+    [environmentAvailability, environmentId, scopes],
+  );
   const moveTargets =
-    issue && board.data ? backlogMoveTargets(board.data, issue, environmentProjects) : [];
+    issue && board.data
+      ? backlogMoveTargets(board.data, issue, environmentProjects, creatableProjectIds)
+      : [];
   const disabled = pending || !connected || issue === null;
   const refreshDetail = detail.refresh;
 
@@ -142,6 +154,22 @@ function BacklogIssueScreen(props: {
     } finally {
       setPending(false);
     }
+  };
+
+  const changeStatus = (status: BacklogIssueStatus) => {
+    const takeover = issue ? claimTakeoverMessage(issue) : null;
+    if (takeover === null) {
+      void runUpdate({ status }, "Could not change the status");
+      return;
+    }
+    Alert.alert("Take over this issue?", takeover, [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Continue",
+        style: "destructive",
+        onPress: () => void runUpdate({ status }, "Could not change the status"),
+      },
+    ]);
   };
 
   const forceRelease = () => {
@@ -320,8 +348,7 @@ function BacklogIssueScreen(props: {
               }))}
               onSelect={(id) => {
                 const status = BACKLOG_ISSUE_STATUSES.find((entry) => entry === id);
-                if (status && status !== issue.status)
-                  void runUpdate({ status }, "Could not change the status");
+                if (status && status !== issue.status) changeStatus(status);
               }}
             />
             <SelectRow

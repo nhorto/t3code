@@ -19,6 +19,9 @@ export const Route = createFileRoute("/_chat/backlog")({
         }
       : {}),
     ...(raw.view === "graph" ? { view: "graph" as const } : {}),
+    ...(raw.messages === true || raw.messages === "true" || raw.messages === 1
+      ? { messages: true as const }
+      : {}),
   }),
   component: BacklogRouteView,
 });

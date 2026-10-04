@@ -67,7 +67,7 @@ export function BacklogQuickAddSheet({
   const navigation = useNavigation();
   const insets = useSafeAreaInsets();
   const draft = useAtomValue(quickAddDraftAtom);
-  const { scopes, connectedEnvironmentIds, environmentLabel, isLoading } = useBacklogBoards();
+  const { scopes, environmentAvailability, environmentLabel } = useBacklogBoards();
   const [scopeKey, setScopeKey] = useState<string | null>(route.params?.scope ?? null);
   const requestedProject = useMemo(() => parseBacklogProjectRef(route.params), [route.params]);
   const [saving, setSaving] = useState(false);
@@ -84,7 +84,8 @@ export function BacklogQuickAddSheet({
       (requestedProject ? findBacklogScopeForProject(pickerScopes, requestedProject)?.key : null) ??
       INBOX_BACKLOG_SCOPE_KEY,
   );
-  const target = resolveBacklogCreateTarget(scope, connectedEnvironmentIds);
+  const resolution = resolveBacklogCreateTarget(scope, environmentAvailability);
+  const target = resolution.target;
   const titleSelection = selection ?? { start: draft.title.length, end: draft.title.length };
 
   const voiceInput = useVoiceInputController({
@@ -130,11 +131,7 @@ export function BacklogQuickAddSheet({
 
   const destination =
     target === null
-      ? isLoading
-        ? "Loading backlogs…"
-        : scope.kind === "project"
-          ? `No connected environment has ${scope.label}. Reconnect one to add here.`
-          : "Connect an environment to add to the backlog."
+      ? resolution.blockedReason
       : `Saves to ${environmentLabel(target.environmentId) ?? "this environment"}`;
 
   return (
@@ -288,7 +285,9 @@ export function BacklogQuickAddSheet({
             <Text
               className={cn(
                 "px-1 text-xs",
-                target === null ? "text-danger-foreground" : "text-foreground-tertiary",
+                target === null && !resolution.loading
+                  ? "text-danger-foreground"
+                  : "text-foreground-tertiary",
               )}
             >
               {destination}

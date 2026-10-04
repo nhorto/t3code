@@ -1,10 +1,13 @@
 import { BacklogId, BacklogIssueId, type Backlog, type BacklogIssue } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
   EMPTY_BACKLOG_BOARD,
+  claimTakeoverMessage,
   foldBacklogStreamEvent,
   groupBacklogIssuesByStatus,
+  isBacklogUnsupportedCause,
   isIssueBlockedOnBoard,
 } from "./backlog.ts";
 
@@ -134,5 +137,42 @@ describe("isIssueBlockedOnBoard", () => {
       issue: { ...blocker, status: "wontfix" },
     });
     expect(isIssueBlockedOnBoard(closed, blocked)).toBe(false);
+  });
+});
+
+describe("isBacklogUnsupportedCause", () => {
+  it("reads a server without the backlog RPCs as unsupported, not broken", () => {
+    expect(isBacklogUnsupportedCause(Cause.die("Unknown request tag: backlog.subscribe"))).toBe(
+      true,
+    );
+    expect(
+      isBacklogUnsupportedCause(Cause.die(new Error("Unknown request tag: backlog.subscribe"))),
+    ).toBe(true);
+  });
+
+  it("keeps real failures as failures", () => {
+    expect(isBacklogUnsupportedCause(Cause.die("Unknown request tag: git.status"))).toBe(false);
+    expect(isBacklogUnsupportedCause(Cause.die(new Error("database is locked")))).toBe(false);
+    expect(isBacklogUnsupportedCause(Cause.fail("Unknown request tag: backlog.subscribe"))).toBe(
+      false,
+    );
+  });
+});
+
+describe("claims", () => {
+  it("asks before taking a claimed issue from its agent", () => {
+    expect(claimTakeoverMessage(issue("free", { key: "WINE-12" }))).toBeNull();
+    expect(
+      claimTakeoverMessage(
+        issue("held", {
+          key: "WINE-12",
+          claim: {
+            actor: { kind: "agent", environmentId: null, threadId: null, label: "Claude" },
+            claimedAt: "2026-01-01T00:00:00.000Z",
+            leaseExpiresAt: "2026-01-01T00:15:00.000Z",
+          },
+        }),
+      ),
+    ).toBe("This takes WINE-12 away from Claude. Continue?");
   });
 });

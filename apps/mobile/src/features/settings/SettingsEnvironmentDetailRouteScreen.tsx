@@ -14,6 +14,7 @@ import { serverEnvironment } from "../../state/server";
 import { environmentSession } from "../../state/session";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useRemoteConnections } from "../../state/use-remote-environment-registry";
+import { BacklogHubSection } from "../backlog/BacklogHubSection";
 import { ConnectionEnvironmentRow } from "../connection/ConnectionEnvironmentRow";
 import { SettingsActionRow } from "./components/SettingsActionRow";
 import { SettingsScreen } from "./components/SettingsScreen";
@@ -331,6 +332,7 @@ function EnvironmentDetail({ environmentId }: { readonly environmentId: Environm
                       </View>
                     ))}
                 </SettingsSection>
+                {allowed ? <BacklogHubSection environmentId={environmentId} /> : null}
               </>
             ) : null}
           </>

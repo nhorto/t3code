@@ -41,7 +41,9 @@ export function BacklogRouteScreen({ route }: StaticScreenProps<BacklogRoutePara
     scopes,
     issuesById,
     notices,
+    unsupportedLabels,
     connectedEnvironmentIds,
+    environmentAvailability,
     environmentLabel,
     isLoading,
   } = useBacklogBoards();
@@ -69,8 +71,8 @@ export function BacklogRouteScreen({ route }: StaticScreenProps<BacklogRoutePara
   const canCreate =
     resolveBacklogCreateTarget(
       scope.kind === "project" ? scope : resolveBacklogScope(scopes, "inbox"),
-      connectedEnvironmentIds,
-    ) !== null;
+      environmentAvailability,
+    ).target !== null;
   const openQuickAdd = useCallback(() => {
     navigation.navigate("BacklogQuickAdd", { scope: defaultQuickAddScopeKey(scope) });
   }, [navigation, scope]);
@@ -195,6 +197,7 @@ export function BacklogRouteScreen({ route }: StaticScreenProps<BacklogRoutePara
               scopeLabel={scope.label}
               scopes={scopes}
               notices={notices}
+              unsupportedLabels={unsupportedLabels}
               loadingMore={isLoading && boards.length > 0}
               onSelectScope={setSelectedScopeKey}
             />
@@ -212,6 +215,7 @@ function BacklogBoardHeader(props: {
   readonly scopeLabel: string;
   readonly scopes: ReturnType<typeof useBacklogBoards>["scopes"];
   readonly notices: ReadonlyArray<BacklogEnvironmentNotice>;
+  readonly unsupportedLabels: ReadonlyArray<string>;
   readonly loadingMore: boolean;
   readonly onSelectScope: (key: string) => void;
 }) {
@@ -264,6 +268,11 @@ function BacklogBoardHeader(props: {
           </Text>
         </View>
       ))}
+      {props.unsupportedLabels.length > 0 ? (
+        <Text className="px-1 text-xs text-foreground-tertiary">
+          {`${props.unsupportedLabels.join(", ")} ${props.unsupportedLabels.length > 1 ? "don't" : "doesn't"} support Backlog yet.`}
+        </Text>
+      ) : null}
       {props.loadingMore ? (
         <Text className="px-1 text-xs text-foreground-tertiary">Loading more environments…</Text>
       ) : null}

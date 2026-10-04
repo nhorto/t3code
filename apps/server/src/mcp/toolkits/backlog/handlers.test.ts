@@ -13,6 +13,9 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 
+import type { BacklogHome } from "../../../backlog/BacklogHome.ts";
+import * as BacklogHubClient from "../../../backlog/BacklogHubClient.ts";
+import * as BacklogRouter from "../../../backlog/BacklogRouter.ts";
 import * as BacklogService from "../../../backlog/BacklogService.ts";
 import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
 import { SqlitePersistenceMemory } from "../../../persistence/Layers/Sqlite.ts";
@@ -44,10 +47,17 @@ const threadsById = new Map([
   ["thread-worker", shell("thread-worker", "Welcome screen")],
 ]);
 
-const services = BacklogService.layer.pipe(
+const services = BacklogRouter.layer.pipe(
+  Layer.provideMerge(BacklogService.layer),
   Layer.provideMerge(
     Layer.mergeAll(
       NodeCrypto.layer,
+      // Not linked to a hub: every call stays on this machine.
+      Layer.mock(BacklogHubClient.BacklogHubClient)({
+        linkedHub: Effect.succeed(Option.none()),
+        // Never reached without a link.
+        home: {} as BacklogHome,
+      }),
       Layer.mock(Project.ProjectService)({
         getShell: (id) =>
           Effect.succeed(
@@ -69,7 +79,9 @@ type Tools = typeof BacklogToolkit.tools;
 /** Calls a tool as the given thread; returns the success or the returned failure. */
 const harness = Effect.gen(function* () {
   const context = yield* Effect.context<
-    BacklogService.BacklogService | ThreadManagement.ThreadManagementService
+    | BacklogService.BacklogService
+    | BacklogRouter.BacklogRouter
+    | ThreadManagement.ThreadManagementService
   >();
   const toolkit = yield* BacklogToolkit.pipe(Effect.provide(BacklogHandlersLive));
   return <Name extends keyof Tools>(
@@ -149,10 +161,14 @@ it.effect("runs a spec through children, exclusive claims, a linked PR, and rele
     const claimed = yield* call("thread-worker", "backlog_claim_next", { parent: "CN-1" });
     expect(claimed.result).toMatchObject({
       claimed: {
+        alreadyHeld: false,
         issue: { key: "CN-2", status: "in_progress" },
         parent: { body: "Spec: welcome, then permissions." },
       },
     });
+
+    const reclaimed = yield* call("thread-worker", "backlog_claim", { issue: "CN-2" });
+    expect(reclaimed.result).toMatchObject({ issue: { key: "CN-2" }, alreadyHeld: true });
 
     const contested = yield* call("thread-orchestrator", "backlog_claim", { issue: "CN-2" });
     expect(contested.isFailure).toBe(true);

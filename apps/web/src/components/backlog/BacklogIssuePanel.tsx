@@ -1,4 +1,5 @@
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
+import { claimTakeoverMessage } from "@t3tools/client-runtime/state/backlog";
 import { isAtomCommandInterrupted } from "@t3tools/client-runtime/state/runtime";
 import {
   isBacklogStatusClosed,
@@ -14,7 +15,7 @@ import {
 } from "@t3tools/contracts";
 import { useNavigate } from "@tanstack/react-router";
 import { BotIcon, ExternalLinkIcon, MessageSquareIcon, RotateCcwIcon, XIcon } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 
 import { readLocalApi } from "../../localApi";
 import {
@@ -44,10 +45,12 @@ import {
   BACKLOG_TYPES,
   backlogMoveTargets,
   blockerCandidates,
+  creatableProjectIdsOn,
   describeBacklogActivity,
   isBacklogSourceWritable,
   reopenStatusFor,
   type BacklogSource,
+  type BacklogSwitcherEntry,
 } from "./backlog.logic";
 import { BacklogTypeIcon } from "./BacklogCard";
 
@@ -60,6 +63,12 @@ const STATUS_OPTIONS: ReadonlyArray<BacklogIssueStatus> = [
   "done",
   "wontfix",
 ];
+
+/** The themed confirm where the app shell hosts one, else the browser's. */
+async function confirmAction(message: string): Promise<boolean> {
+  const api = readLocalApi();
+  return api ? api.dialogs.confirm(message) : window.confirm(message);
+}
 
 function reportFailure(title: string, result: Parameters<typeof backlogFailureMessage>[0]) {
   toastManager.add(
@@ -146,6 +155,8 @@ export interface BacklogIssuePanelProps {
   readonly environmentId: EnvironmentId;
   readonly issueId: BacklogIssueId;
   readonly source: BacklogSource | null;
+  /** The switcher, to know which projects a move may create a backlog for. */
+  readonly entries: ReadonlyArray<BacklogSwitcherEntry>;
   readonly onClose: () => void;
   readonly onOpenIssue: (environmentId: EnvironmentId, issueId: BacklogIssueId) => void;
 }
@@ -205,6 +216,7 @@ export function BacklogIssuePanel(props: BacklogIssuePanelProps) {
 function IssueDetailBody({
   environmentId,
   source,
+  entries,
   onOpenIssue,
   issue,
   detail,
@@ -223,6 +235,8 @@ function IssueDetailBody({
   const closed = isBacklogStatusClosed(issue.status);
   const [editingBody, setEditingBody] = useState(false);
   const [bodyDraft, setBodyDraft] = useState("");
+  // The row's version when editing began: a newer row means someone else may have edited it.
+  const [bodyBaseUpdatedAt, setBodyBaseUpdatedAt] = useState<string | null>(null);
   const [commentDraft, setCommentDraft] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -235,6 +249,23 @@ function IssueDetailBody({
   };
   const update = (input: Omit<BacklogUpdateIssueInput, "issueId">) =>
     run(() => commands.update({ issueId: issue.id, ...input }));
+  const changeStatus = async (status: BacklogIssueStatus) => {
+    const takeover = claimTakeoverMessage(issue);
+    if (takeover !== null && !(await confirmAction(takeover))) return;
+    void update({ status });
+  };
+  const saveBody = async () => {
+    if (
+      bodyBaseUpdatedAt !== null &&
+      bodyBaseUpdatedAt !== issue.updatedAt &&
+      !(await confirmAction(
+        `${issue.key} changed since you started editing. Save your description over it?`,
+      ))
+    ) {
+      return;
+    }
+    if (await update({ body: bodyDraft })) setEditingBody(false);
+  };
 
   const openThread = (threadEnvironmentId: EnvironmentId | null, threadId: ThreadId) => {
     void navigate({
@@ -250,10 +281,15 @@ function IssueDetailBody({
     else window.open(url, "_blank", "noopener,noreferrer");
   };
 
+  const creatableProjectIds = useMemo(
+    () => creatableProjectIdsOn(entries, environmentId),
+    [entries, environmentId],
+  );
   const moveTargets = backlogMoveTargets({
     currentBacklogId: issue.backlogId,
     backlogs: board?.backlogs ?? [],
     projects: projects.filter((project) => project.environmentId === environmentId),
+    creatableProjectIds,
   });
   const blockers = issue.blockedBy.map(
     (blockerId) =>
@@ -305,7 +341,7 @@ function IssueDetailBody({
           value={issue.status}
           disabled={!writable || busy}
           onValueChange={(next) => {
-            if (next && next !== issue.status) void update({ status: next as BacklogIssueStatus });
+            if (next && next !== issue.status) void changeStatus(next as BacklogIssueStatus);
           }}
         >
           <SelectTrigger size="sm" aria-label="Status" className="min-w-0">
@@ -449,7 +485,7 @@ function IssueDetailBody({
               onKeyDown={(event) => {
                 if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
                   event.preventDefault();
-                  void update({ body: bodyDraft }).then((ok) => ok && setEditingBody(false));
+                  void saveBody();
                 }
                 if (event.key === "Escape") {
                   event.preventDefault();
@@ -462,13 +498,7 @@ function IssueDetailBody({
               <Button size="sm" variant="ghost" onClick={() => setEditingBody(false)}>
                 Cancel
               </Button>
-              <Button
-                size="sm"
-                disabled={busy}
-                onClick={() =>
-                  void update({ body: bodyDraft }).then((ok) => ok && setEditingBody(false))
-                }
-              >
+              <Button size="sm" disabled={busy} onClick={() => void saveBody()}>
                 Save
               </Button>
             </div>
@@ -487,6 +517,7 @@ function IssueDetailBody({
                 className="self-start"
                 onClick={() => {
                   setBodyDraft(detail.body);
+                  setBodyBaseUpdatedAt(detail.issue.updatedAt);
                   setEditingBody(true);
                 }}
               >

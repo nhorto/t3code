@@ -86,6 +86,9 @@ export const AuthAccessReadScope = "access:read" as const;
 export const AuthAccessWriteScope = "access:write" as const;
 export const AuthRelayReadScope = "relay:read" as const;
 export const AuthRelayWriteScope = "relay:write" as const;
+/** Backlog-only scopes, for a server linked to this one as a backlog hub. */
+export const AuthBacklogReadScope = "backlog:read" as const;
+export const AuthBacklogWriteScope = "backlog:write" as const;
 export const AuthEnvironmentScope = Schema.Literals([
   AuthOrchestrationReadScope,
   AuthOrchestrationOperateScope,
@@ -95,6 +98,8 @@ export const AuthEnvironmentScope = Schema.Literals([
   AuthAccessWriteScope,
   AuthRelayReadScope,
   AuthRelayWriteScope,
+  AuthBacklogReadScope,
+  AuthBacklogWriteScope,
 ]);
 export type AuthEnvironmentScope = typeof AuthEnvironmentScope.Type;
 export const AuthEnvironmentScopes = Schema.Array(AuthEnvironmentScope);
@@ -113,6 +118,30 @@ export const AuthAdministrativeScopes = [
   AuthAccessWriteScope,
   AuthRelayWriteScope,
 ] as const;
+
+/** Scopes a backlog fleet link asks the hub for. */
+export const AuthBacklogLinkScopes = [AuthBacklogReadScope, AuthBacklogWriteScope] as const;
+
+/**
+ * Broader scopes that already grant a narrower one, so sessions issued before
+ * the narrower scope existed keep their access.
+ */
+const AUTH_SCOPE_IMPLIED_BY: Partial<Record<AuthEnvironmentScope, AuthEnvironmentScope>> = {
+  [AuthBacklogReadScope]: AuthOrchestrationReadScope,
+  [AuthBacklogWriteScope]: AuthOrchestrationOperateScope,
+};
+
+/** Whether held scopes grant `required`, directly or through a broader scope. */
+export function hasAuthScope(
+  held: ReadonlyArray<AuthEnvironmentScope> | ReadonlySet<AuthEnvironmentScope>,
+  required: AuthEnvironmentScope,
+): boolean {
+  const holds = (scope: AuthEnvironmentScope) =>
+    "has" in held ? held.has(scope) : held.includes(scope);
+  if (holds(required)) return true;
+  const broader = AUTH_SCOPE_IMPLIED_BY[required];
+  return broader !== undefined && holds(broader);
+}
 
 export const AuthTokenExchangeGrantType =
   "urn:ietf:params:oauth:grant-type:token-exchange" as const;
